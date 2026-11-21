@@ -1,0 +1,5 @@
+*
+!rust-pipeline/Cargo.toml
+!rust-pipeline/Cargo.lock
+!rust-pipeline/.cargo
+!rust-pipeline/src
