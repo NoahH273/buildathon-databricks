@@ -381,73 +381,82 @@ pub fn comp_person(idx: u64) -> u64 {
 #[cfg(not(target_feature = "avx2"))]
 compile_error!("build with AVX2 (see .cargo/config.toml)");
 
-/// Bitmasks of '\n', ',' and '"' over the 128 bytes starting at p.
+/// Bitmasks of '\n', ',' and '"' over the 64 bytes starting at p.
 #[inline(always)]
-pub unsafe fn masks128(p: *const u8) -> (u128, u128, u128) {
+unsafe fn masks64(p: *const u8) -> (u64, u64, u64) {
     use std::arch::x86_64::*;
-    let nlv = _mm256_set1_epi8(b'\n' as i8);
-    let cv = _mm256_set1_epi8(b',' as i8);
-    let qv = _mm256_set1_epi8(b'"' as i8);
-    let mut nl = [0u32; 4];
-    let mut cm = [0u32; 4];
-    let mut qt = [0u32; 4];
-    for k in 0..4 {
-        let v = _mm256_loadu_si256(p.add(32 * k) as *const __m256i);
-        nl[k] = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, nlv)) as u32;
-        cm[k] = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, cv)) as u32;
-        qt[k] = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, qv)) as u32;
-    }
-    let j = |a: [u32; 4]| -> u128 {
-        (a[0] as u128) | ((a[1] as u128) << 32) | ((a[2] as u128) << 64) | ((a[3] as u128) << 96)
+    let a = _mm256_loadu_si256(p as *const __m256i);
+    let b = _mm256_loadu_si256(p.add(32) as *const __m256i);
+    let m = |ch: u8| -> u64 {
+        let v = _mm256_set1_epi8(ch as i8);
+        (_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, v)) as u32 as u64)
+            | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(b, v)) as u32 as u64) << 32)
     };
-    (j(nl), j(cm), j(qt))
+    (m(b'\n'), m(b','), m(b'"'))
 }
 
+/// 128 mask bits starting at bit `r` of a block-mask array (reads entries r/64 ..= r/64+2).
 #[inline(always)]
-fn range_mask(s: u32, e: u32) -> u128 {
-    // bits [s, e); e <= 127
-    ((1u128 << e) - 1) & !((1u128 << s) - 1)
+fn window(m: &[u64], r: usize) -> u128 {
+    let w = r >> 6;
+    let o = (r & 63) as u32;
+    unsafe {
+        let lo = *m.get_unchecked(w) as u128;
+        let mid = *m.get_unchecked(w + 1) as u128;
+        let hi = *m.get_unchecked(w + 2) as u128;
+        (((mid << 64) | lo) >> o) | ((hi << 64) << (64 - o))
+    }
 }
 
-/// Fields of a line of length l (< 128) from its comma/quote masks. Returns false if malformed.
+/// Inclusive prefix XOR of a 128-bit mask (bit i = parity of bits 0..=i).
 #[inline(always)]
-pub fn fields_from_masks<const N: usize>(l: u32, cm: u128, qt: u128, f: &mut [(u32, u32); N]) -> bool {
-    if l == 0 {
-        return false;
+fn prefix_xor128(x: u128) -> u128 {
+    use std::arch::x86_64::*;
+    unsafe {
+        let ones = _mm_set1_epi8(-1);
+        let lo = _mm_cvtsi128_si64(_mm_clmulepi64_si128(_mm_set_epi64x(0, x as u64 as i64), ones, 0)) as u64;
+        let hi = _mm_cvtsi128_si64(_mm_clmulepi64_si128(_mm_set_epi64x(0, (x >> 64) as u64 as i64), ones, 0)) as u64;
+        let hi = hi ^ (((lo as i64) >> 63) as u64);
+        ((hi as u128) << 64) | lo as u128
     }
-    let m = (1u128 << l) - 1;
-    let mut c = cm & m;
-    let q = qt & m;
-    if c.count_ones() as usize != N - 1 {
-        return false;
-    }
+}
+
+/// Fields of a line of length l (< 128) from its comma/quote masks; false if malformed.
+/// A field may be wrapped in one pair of quotes; any other quote, or a separator inside
+/// quotes, makes the line malformed.
+#[inline(always)]
+fn fields_from_masks<const N: usize>(line: *const u8, l: u32, cm: u128, qt: u128, f: &mut [(u32, u32); N]) -> bool {
+    let lm = (1u128 << l) - 1;
+    let mut c = cm & lm;
+    let q = qt & lm;
+    let mut ok = c.count_ones() as usize == N - 1;
+    // every quote opens at a field start or closes at a field end (never both), and no
+    // separator lies between an opening and its closing quote
+    let sep = c | (1u128 << l);
+    let starts = (sep << 1) | 1;
+    let ends = sep >> 1;
+    let open = q & starts;
+    let close = q & ends;
+    ok &= ((open | close) == q) & ((open & close) == 0) & ((prefix_xor128(q) & sep) == 0);
     let mut s = 0u32;
     for k in 0..N {
         let e = if k + 1 < N {
-            let e = c.trailing_zeros();
-            c &= c - 1;
+            let e = c.trailing_zeros().min(l);
+            c &= c.wrapping_sub(1);
             e
         } else {
             l
         };
-        f[k] = (s, e);
+        // in a valid line, a field starting with a quote also ends with one
+        let qd = ((s < e) && unsafe { *line.add(s as usize) } == b'"') as u32;
+        f[k] = (s + qd, e - qd);
         s = e + 1;
     }
-    if q != 0 {
-        for k in 0..N {
-            let (s, e) = f[k];
-            let qq = q & range_mask(s, e);
-            if qq != 0 {
-                if e - s >= 2 && qq == ((1u128 << s) | (1u128 << (e - 1))) {
-                    f[k] = (s + 1, e - 1);
-                } else {
-                    return false;
-                }
-            }
-        }
-    }
-    true
+    ok
 }
+
+const SUB: usize = 16 << 10;
+const NB: usize = SUB / 64 + 2;
 
 /// Call `f(line_start, fields)` for every well-formed line starting in [start, end),
 /// skipping the file's header line. Field ranges are relative to line_start.
@@ -468,29 +477,241 @@ pub fn scan_lines<const N: usize>(data: &[u8], start: usize, end: usize, mut f: 
     }
     let mut fr = [(0u32, 0u32); N];
     let ptr = data.as_ptr();
+    let mut mnl = [0u64; NB + 2];
+    let mut mcm = [0u64; NB + 2];
+    let mut mqt = [0u64; NB + 2];
     while pos < end {
-        if pos + 128 <= len {
-            let (nl, cm, qt) = unsafe { masks128(ptr.add(pos)) };
-            if nl != 0 {
-                let l = nl.trailing_zeros();
-                if fields_from_masks::<N>(l, cm, qt, &mut fr) {
-                    f(pos, &fr);
-                }
-                pos += l as usize + 1;
+        // index a region; every line starting in its first `lim` bytes lies inside it
+        let base = pos;
+        let nb = ((len - base) / 64).min(NB);
+        for k in 0..nb {
+            let (a, b, c) = unsafe { masks64(ptr.add(base + 64 * k)) };
+            mnl[k] = a;
+            mcm[k] = b;
+            mqt[k] = c;
+        }
+        let lim = (nb * 64).saturating_sub(128).min(SUB).min(end - base);
+        let mut r = 0usize;
+        while r < lim {
+            let nl = window(&mnl, r);
+            if nl == 0 {
+                // a line of 128+ bytes
+                let p = base + r;
+                let e = match memchr::memchr(b'\n', &data[p..]) {
+                    Some(x) => p + x,
+                    None => len,
+                };
+                slow_line::<N>(data, p, e, &mut f);
+                r = e + 1 - base;
                 continue;
             }
-        }
-        let e = match memchr::memchr(b'\n', &data[pos..]) {
-            Some(p) => pos + p,
-            None => len,
-        };
-        let mut ff = [(0usize, 0usize); N];
-        if split::<N>(&data[pos..e], &mut ff) {
-            for k in 0..N {
-                fr[k] = (ff[k].0 as u32, ff[k].1 as u32);
+            let l = nl.trailing_zeros();
+            if fields_from_masks::<N>(unsafe { ptr.add(base + r) }, l, window(&mcm, r), window(&mqt, r), &mut fr) {
+                f(base + r, &fr);
             }
-            f(pos, &fr);
+            r += l as usize + 1;
         }
-        pos = e + 1;
+        pos = base + r;
+        if nb < NB {
+            // end of the file: plain scalar
+            while pos < end {
+                let e = match memchr::memchr(b'\n', &data[pos..]) {
+                    Some(p) => pos + p,
+                    None => len,
+                };
+                slow_line::<N>(data, pos, e, &mut f);
+                pos = e + 1;
+            }
+        }
     }
+}
+
+#[inline(never)]
+fn slow_line<const N: usize>(data: &[u8], p: usize, e: usize, f: &mut impl FnMut(usize, &[(u32, u32); N])) {
+    let mut ff = [(0usize, 0usize); N];
+    if split::<N>(&data[p..e], &mut ff) {
+        let mut fr = [(0u32, 0u32); N];
+        for k in 0..N {
+            fr[k] = (ff[k].0 as u32, ff[k].1 as u32);
+        }
+        f(p, &fr);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SIMD field parsers. Callers guarantee that the 16 bytes before the field's end and the
+// 20 bytes from its start are readable (any field of a line that starts at least 16 bytes
+// into the data and has 128 bytes after its start).
+
+const fn build_tables() -> ([u8; 256], [u8; 256], [u16; 256]) {
+    let mut leap = [0u8; 256];
+    let mut mlen = [0u8; 256];
+    let mut mcum = [0u16; 256];
+    let mut i = 0;
+    while i < 256 {
+        let y = 1900 + i;
+        leap[i] = ((y % 4 == 0 && y % 100 != 0) || y % 400 == 0) as u8;
+        i += 1;
+    }
+    let lens = [31u8, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let mut l = 0;
+    while l < 2 {
+        let mut m = 1;
+        let mut cum = 0u16;
+        while m <= 12 {
+            let len = if m == 2 && l == 1 { 29 } else { lens[m - 1] };
+            mlen[l * 128 + m] = len;
+            mcum[l * 128 + m] = cum;
+            cum += len as u16;
+            m += 1;
+        }
+        l += 1;
+    }
+    (leap, mlen, mcum)
+}
+static TABLES: ([u8; 256], [u8; 256], [u16; 256]) = build_tables();
+
+/// `YYYY-MM-DDTHH:MM:SS` at p to local epoch seconds.
+#[inline(always)]
+unsafe fn dt_fast(p: *const u8) -> Option<i64> {
+    use std::arch::x86_64::*;
+    let a = _mm_loadu_si128(p as *const __m128i);
+    let b = _mm_loadu_si128(p.add(4) as *const __m128i);
+    let pat = _mm_setr_epi8(b'-' as i8, 0, 0, b'-' as i8, 0, 0, b'T' as i8, 0, 0, b':' as i8, 0, 0, b':' as i8, 0, 0, 0);
+    let sep = (_mm_movemask_epi8(_mm_cmpeq_epi8(b, pat)) & 0x1249) == 0x1249;
+    let db = _mm_shuffle_epi8(b, _mm_setr_epi8(1, 2, 4, 5, 7, 8, 10, 11, 13, 14, -1, -1, -1, -1, -1, -1));
+    let da = _mm_shuffle_epi8(a, _mm_setr_epi8(-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 1, 2, 3, -1, -1));
+    let d = _mm_sub_epi8(_mm_or_si128(db, da), _mm_set1_epi8(b'0' as i8));
+    let dig = (_mm_movemask_epi8(_mm_cmpeq_epi8(_mm_min_epu8(d, _mm_set1_epi8(9)), d)) & 0x3FFF) == 0x3FFF;
+    if !(sep & dig) {
+        return None;
+    }
+    let v = _mm_maddubs_epi16(d, _mm_setr_epi8(10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 0, 0));
+    let mo = _mm_extract_epi16(v, 0) as u32;
+    let dd = _mm_extract_epi16(v, 1) as u32;
+    let h = _mm_extract_epi16(v, 2) as u32;
+    let mi = _mm_extract_epi16(v, 3) as u32;
+    let s = _mm_extract_epi16(v, 4) as u32;
+    let y = _mm_extract_epi16(v, 5) as u32 * 100 + _mm_extract_epi16(v, 6) as u32;
+    let yi = y.wrapping_sub(1900);
+    if yi >= 256 {
+        return dt_swar(p).map(|ms| ms / 1000);
+    }
+    let (leap, mlen, mcum) = &TABLES;
+    let li = (*leap.get_unchecked(yi as usize) as usize) * 128 + mo as usize;
+    let ml = *mlen.get_unchecked(li) as u32;
+    if (dd.wrapping_sub(1) >= ml) | (h > 23) | (mi > 59) | (s > 59) {
+        return None;
+    }
+    let days = *YEAR_DAYS.get_unchecked(yi as usize) as i64 + *mcum.get_unchecked(li) as i64 + dd as i64 - 1;
+    Some(days * 86400 + (h * 3600 + mi * 60 + s) as i64)
+}
+
+/// The value of the n (1..=16) ASCII digits ending at `end`, or None if any is not a digit.
+#[inline(always)]
+pub unsafe fn digits16(end: *const u8, n: usize) -> Option<u64> {
+    use std::arch::x86_64::*;
+    let v = _mm_loadu_si128(end.sub(16) as *const __m128i);
+    let d = _mm_sub_epi8(v, _mm_set1_epi8(b'0' as i8));
+    let idx = _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+    let keep = _mm_cmpgt_epi8(idx, _mm_set1_epi8(15 - n as i8));
+    let isdig = _mm_cmpeq_epi8(_mm_min_epu8(d, _mm_set1_epi8(9)), d);
+    if _mm_movemask_epi8(_mm_andnot_si128(isdig, keep)) != 0 {
+        return None;
+    }
+    let d = _mm_and_si128(d, keep);
+    let t1 = _mm_maddubs_epi16(d, _mm_setr_epi8(10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1));
+    let t2 = _mm_madd_epi16(t1, _mm_setr_epi16(100, 1, 100, 1, 100, 1, 100, 1));
+    let t3 = _mm_packus_epi32(t2, t2);
+    let t4 = _mm_madd_epi16(t3, _mm_setr_epi16(10000, 1, 10000, 1, 10000, 1, 10000, 1));
+    let hi = _mm_cvtsi128_si32(t4) as u32 as u64;
+    let lo = _mm_extract_epi32(t4, 1) as u32 as u64;
+    Some(hi * 100_000_000 + lo)
+}
+
+/// `parse_ts` for a field at p of length n, under the fast-path read guarantee.
+#[inline(always)]
+pub unsafe fn parse_ts_fast(p: *const u8, n: usize) -> Option<i64> {
+    if n >= 5 && *p.add(4) == b'-' {
+        if n == 20 {
+            if *p.add(19) != b'Z' {
+                return None;
+            }
+            return dt_fast(p).map(|s| s * 1000);
+        }
+        if n == 25 {
+            let sign = *p.add(19);
+            if (sign != b'+' && sign != b'-') || *p.add(22) != b':' {
+                return None;
+            }
+            let oh = (*p.add(20)).wrapping_sub(b'0') as u32;
+            let oh2 = (*p.add(21)).wrapping_sub(b'0') as u32;
+            let om = (*p.add(23)).wrapping_sub(b'0') as u32;
+            let om2 = (*p.add(24)).wrapping_sub(b'0') as u32;
+            if oh > 9 || oh2 > 9 || om > 9 || om2 > 9 {
+                return None;
+            }
+            let (oh, om) = (oh * 10 + oh2, om * 10 + om2);
+            if oh > 23 || om > 59 {
+                return None;
+            }
+            let local = dt_fast(p)? * 1000;
+            let off = ((oh as i64) * 60 + om as i64) * 60_000;
+            return Some(if sign == b'+' { local - off } else { local + off });
+        }
+        return None;
+    }
+    if n.wrapping_sub(1) < 16 {
+        return digits16(p.add(n), n).map(|v| v as i64);
+    }
+    parse_ts(std::slice::from_raw_parts(p, n))
+}
+
+/// `parse_f1` under the fast-path read guarantee.
+#[inline(always)]
+pub unsafe fn parse_f1_fast(p: *const u8, n: usize) -> Option<i64> {
+    if n != 20 || *p.add(19) != b'Z' {
+        return None;
+    }
+    dt_fast(p).map(|s| s * 1000)
+}
+
+/// Purchase price under the fast-path read guarantee.
+#[inline(always)]
+pub unsafe fn parse_price_fast(p: *const u8, n: usize) -> Option<u32> {
+    if n.wrapping_sub(1) >= 16 {
+        return parse_price(std::slice::from_raw_parts(p, n));
+    }
+    let v = digits16(p.add(n), n)?;
+    if v.wrapping_sub(1) < 10_000_000 {
+        Some(v as u32)
+    } else {
+        None
+    }
+}
+
+/// Product id `p<digits>` with no leading zero (or exactly "p0") as its number; None otherwise.
+#[inline(always)]
+pub unsafe fn product_num(p: *const u8, n: usize) -> Option<u32> {
+    if n < 2 || n > 8 || *p != b'p' || (*p.add(1) == b'0' && n > 2) {
+        return None;
+    }
+    digits16(p.add(n), n - 1).map(|v| v as u32)
+}
+
+/// Scalar `product_num` for any slice.
+pub fn product_num_slice(b: &[u8]) -> Option<u32> {
+    let n = b.len();
+    if n < 2 || n > 8 || b[0] != b'p' || (b[1] == b'0' && n > 2) {
+        return None;
+    }
+    let mut v = 0u32;
+    for &c in &b[1..] {
+        let d = c.wrapping_sub(b'0');
+        if d > 9 {
+            return None;
+        }
+        v = v * 10 + d as u32;
+    }
+    Some(v)
 }

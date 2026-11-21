@@ -11,10 +11,11 @@ pub struct Scatter<T: Copy, const B: usize> {
 impl<T: Copy, const B: usize> Scatter<T, B> {
     pub fn new(parts: usize, cap_each: usize) -> Self {
         let zero: T = unsafe { std::mem::zeroed() };
+        let out: Vec<Vec<T>> = (0..parts).map(|_| Vec::with_capacity(cap_each)).collect();
         Scatter {
             stage: vec![zero; parts * B],
             fill: vec![0; parts],
-            out: (0..parts).map(|_| Vec::with_capacity(cap_each)).collect(),
+            out,
         }
     }
 

@@ -23,6 +23,7 @@ pub const LINKED_BIT: u64 = 1 << 63;
 const B1: usize = 6; // staging depth, event_id partitions
 const B2: usize = 8; // staging depth, person partitions
 const RING: usize = 8; // link lookups in flight per parsing thread
+const NO_PROD: u16 = u16::MAX;
 
 /// Stage-1 event record, partitioned by event_id hash.
 #[repr(C, packed)]
@@ -75,6 +76,7 @@ struct Ctx {
     ev_hi: u32,
     cl_hi: u32,
     products: U64Map,
+    prod_arr: Vec<u16>,
     unknown_cat: u32,
     campaigns: U64Map,
     b1: u32,
@@ -89,6 +91,22 @@ impl Ctx {
             Some(FileData::Mem(v)) => &v[..],
             None => &[],
         }
+    }
+    /// Category index of a product id (`num` is its `product_num`).
+    #[inline(always)]
+    fn category(&self, num: Option<u32>, id: &[u8]) -> u32 {
+        if let Some(n) = num {
+            if (n as usize) < self.prod_arr.len() {
+                let c = unsafe { *self.prod_arr.get_unchecked(n as usize) };
+                return if c == NO_PROD { self.unknown_cat } else { c as u32 };
+            }
+        }
+        self.products.get(hash(id)).unwrap_or(self.unknown_cat)
+    }
+    #[inline(always)]
+    fn ref_ptr(&self, r: u64) -> *const u8 {
+        let d = self.data((r >> OFF_BITS) as usize);
+        unsafe { d.as_ptr().add((r & OFF_MASK) as usize) }
     }
     /// The field value a ref points at: bytes up to the next ',', '"', '\n' or EOF.
     #[inline]
@@ -106,6 +124,11 @@ impl Ctx {
         }
         &s[..e]
     }
+}
+
+#[inline(always)]
+fn prefetch(p: *const u8) {
+    unsafe { std::arch::x86_64::_mm_prefetch(p as *const i8, std::arch::x86_64::_MM_HINT_T0) };
 }
 
 fn env_or(name: &str, idx: usize, default: &str) -> PathBuf {
@@ -202,23 +225,40 @@ fn main() {
 
     let prod_data = std::fs::read(data_dir.join("products.csv")).unwrap_or_default();
     let mut cat_names: Vec<Vec<u8>> = Vec::new();
-    let mut prod_rows: Vec<(u64, Vec<u8>)> = Vec::new();
+    let mut prod_rows: Vec<(u64, Option<u32>, Vec<u8>)> = Vec::new();
     for line in small_lines(&prod_data) {
         let mut f = [(0, 0); 2];
         if !split::<2>(line, &mut f) || f[0].0 == f[0].1 {
             continue;
         }
-        prod_rows.push((hash(&line[f[0].0..f[0].1]), line[f[1].0..f[1].1].to_vec()));
+        let pid = &line[f[0].0..f[0].1];
+        prod_rows.push((hash(pid), product_num_slice(pid), line[f[1].0..f[1].1].to_vec()));
         cat_names.push(line[f[1].0..f[1].1].to_vec());
     }
     cat_names.push(b"unknown".to_vec());
     cat_names.sort();
     cat_names.dedup();
     assert!(cat_names.len() <= 256, "too many categories");
+    // `p<number>` ids index an array; any other id goes through the hash map
+    const PROD_LIMIT: u32 = 1 << 22;
     let mut products = U64Map::with_capacity(prod_rows.len());
-    for (h, c) in &prod_rows {
+    let mut prod_arr: Vec<u16> = Vec::new();
+    for (h, num, c) in &prod_rows {
         let id = cat_names.binary_search(c).unwrap() as u32;
-        products.insert(*h, id);
+        match num {
+            Some(n) if *n < PROD_LIMIT => {
+                let n = *n as usize;
+                if prod_arr.len() <= n {
+                    prod_arr.resize(n + 1, NO_PROD);
+                }
+                if prod_arr[n] == NO_PROD {
+                    prod_arr[n] = id as u16;
+                }
+            }
+            _ => {
+                products.insert(*h, id);
+            }
+        }
     }
     let unknown_cat = cat_names.binary_search(&b"unknown".to_vec()).unwrap() as u32;
 
@@ -291,7 +331,7 @@ fn main() {
     let est_events = ev_bytes / 70 + 1;
     let est_clicks = cl_bytes / 45 + 1;
     let b1 = ((est_events / 40_000).max(16).next_power_of_two().trailing_zeros()).min(12);
-    let b2 = ((est_events / 80_000).max(16).next_power_of_two().trailing_zeros()).min(9);
+    let b2 = ((est_events / 40_000).max(16).next_power_of_two().trailing_zeros()).min(11);
     let p1 = 1usize << b1;
     let p2 = 1usize << b2;
 
@@ -302,6 +342,7 @@ fn main() {
         ev_hi: (we - base) as u32,
         cl_hi: (we - base) as u32,
         products,
+        prod_arr,
         unknown_cat,
         campaigns,
         b1,
@@ -470,6 +511,7 @@ fn main() {
         if rows > 0 {
             st.write_user_daily(&cat_names, &ud_dir.join(format!("part-{:05}.parquet", tid)));
         }
+
         (stats, rows)
     });
     eprintln!("phase3 {:?}", t0.elapsed());
@@ -599,7 +641,13 @@ fn parse_clicks(ctx: &Ctx, linked: &Linked, c: Chunk, out: &mut Scatter<Cl, B2>)
         if f[0].0 == f[0].1 || f[1].0 == f[1].1 {
             return;
         }
-        let ts = match parse_ts(fld(data, pos, f[3])) {
+        let fast = pos >= 16 && pos + 128 <= data.len();
+        let tsr = if fast {
+            unsafe { parse_ts_fast(data.as_ptr().add(pos + f[3].0 as usize), (f[3].1 - f[3].0) as usize) }
+        } else {
+            parse_ts(fld(data, pos, f[3]))
+        };
+        let ts = match tsr {
             Some(t) => t - base,
             None => return,
         };
@@ -642,8 +690,13 @@ fn parse_events(ctx: &Ctx, linked: &Linked, c: Chunk, out: &mut Scatter<Ev1, B1>
         if f[0].0 == f[0].1 {
             return;
         }
+        // the SIMD field parsers may read up to 16 bytes before a field and 20 after its start
+        let fast = pos >= 16 && pos + 128 <= data.len();
+        let fp = |k: usize| unsafe { data.as_ptr().add(pos + f[k].0 as usize) };
+        let fl = |k: usize| (f[k].1 - f[k].0) as usize;
         let eid = hash(fld(data, pos, f[0]));
-        let ingest_ms = parse_f1(fld(data, pos, f[3])).unwrap_or(i64::MAX / 4);
+        let ingest_ms = if fast { unsafe { parse_f1_fast(fp(3), fl(3)) } } else { parse_f1(fld(data, pos, f[3])) }
+            .unwrap_or(i64::MAX / 4);
         let ingest = (ingest_ms.div_euclid(1000) - base_s).clamp(i32::MIN as i64, i32::MAX as i64) as i32;
         let mut rec = Ev1 { eid, person: 0, name: 0, ts: INVALID, ingest, pc: 0 };
         'v: {
@@ -666,7 +719,8 @@ fn parse_events(ctx: &Ctx, linked: &Linked, c: Chunk, out: &mut Scatter<Ev1, B1>
             } else {
                 break 'v;
             };
-            let ts_abs = match parse_ts(fld(data, pos, f[2])) {
+            let tsr = if fast { unsafe { parse_ts_fast(fp(2), fl(2)) } } else { parse_ts(fld(data, pos, f[2])) };
+            let ts_abs = match tsr {
                 Some(t) => t,
                 None => break 'v,
             };
@@ -679,18 +733,21 @@ fn parse_events(ctx: &Ctx, linked: &Linked, c: Chunk, out: &mut Scatter<Ev1, B1>
             }
             let mut price = 0u32;
             if purchase {
-                price = match parse_price(fld(data, pos, f[6])) {
+                let pr = if fast { unsafe { parse_price_fast(fp(6), fl(6)) } } else { parse_price(fld(data, pos, f[6])) };
+                price = match pr {
                     Some(p) => p,
                     None => break 'v,
                 };
             }
-            let cat = ctx.products.get(hash(fld(data, pos, f[5]))).unwrap_or(ctx.unknown_cat);
+            let pid = fld(data, pos, f[5]);
+            let num = if fast { unsafe { product_num(fp(5), fl(5)) } } else { product_num_slice(pid) };
+            let cat = ctx.category(num, pid);
             let user = hash(fld(data, pos, f[1]));
-            linked.map.prefetch(user);
             rec.person = user;
             rec.name = fbase | (pos + f[1].0 as usize) as u64;
             rec.ts = ts as u32;
             rec.pc = (price << 8) | cat;
+            linked.map.prefetch(user);
             ring.push(rec, &mut done);
             return;
         }
@@ -800,6 +857,7 @@ struct P3State<'a> {
     sess: Vec<Sess>,
     starts: Vec<u32>,
     daygroups: Vec<(u32, u32)>, // (day idx, first session index)
+    bounds: Vec<u32>,
     tmpcl: Vec<(u32, u32)>,     // (camp, ts)
     counts: Vec<u32>,
     // user_daily columns
@@ -834,6 +892,7 @@ impl<'a> P3State<'a> {
             sess: Vec::new(),
             starts: Vec::new(),
             daygroups: Vec::new(),
+            bounds: Vec::new(),
             tmpcl: Vec::new(),
             counts: Vec::new(),
             rows: 0,
@@ -863,14 +922,32 @@ impl<'a> P3State<'a> {
             at.cmp(&bt).then_with(|| ctx.ref_str(a.cid).cmp(ctx.ref_str(b.cid)))
         });
         let n = evs.len();
-        let mut i = 0;
-        let mut ci = 0;
-        while i < n {
-            let p = evs[i].person;
-            let mut j = i + 1;
-            while j < n && evs[j].person == p {
-                j += 1;
+        // person boundaries, so that name lookups can be prefetched a few people ahead
+        self.bounds.clear();
+        let mut prev = 0u64;
+        for (k, e) in evs.iter().enumerate() {
+            let p = e.person;
+            if k == 0 || p != prev {
+                self.bounds.push(k as u32);
             }
+            prev = p;
+        }
+        self.bounds.push(n as u32);
+        let np = self.bounds.len() - 1;
+        let mut ci = 0;
+        for pi in 0..np {
+            if pi + 8 < np {
+                let nw = evs[self.bounds[pi + 8] as usize].name;
+                if nw & LINKED_BIT != 0 {
+                    prefetch(unsafe { self.link_names.as_ptr().add((nw & !LINKED_BIT) as usize) } as *const u8);
+                }
+            }
+            if pi + 4 < np {
+                let r = self.name_ref(evs[self.bounds[pi + 4] as usize].name);
+                prefetch(ctx.ref_ptr(r));
+            }
+            let (i, j) = (self.bounds[pi] as usize, self.bounds[pi + 1] as usize);
+            let p = evs[i].person;
             while ci < cls.len() && cls[ci].person < p {
                 ci += 1;
             }
@@ -879,7 +956,6 @@ impl<'a> P3State<'a> {
                 ck += 1;
             }
             self.process_person(ctx, &evs[i..j], &cls[ci..ck]);
-            i = j;
             ci = ck;
         }
     }
@@ -905,12 +981,17 @@ impl<'a> P3State<'a> {
         self.rows += 1;
     }
 
-    fn process_person(&mut self, ctx: &Ctx, ev: &[Ev2], cl: &[Cl]) {
-        let name = if ev[0].name & LINKED_BIT != 0 {
-            self.link_names[(ev[0].name & !LINKED_BIT) as usize]
+    #[inline(always)]
+    fn name_ref(&self, w: u64) -> u64 {
+        if w & LINKED_BIT != 0 {
+            unsafe { *self.link_names.get_unchecked((w & !LINKED_BIT) as usize) }
         } else {
-            ev[0].name
-        };
+            w
+        }
+    }
+
+    fn process_person(&mut self, ctx: &Ctx, ev: &[Ev2], cl: &[Cl]) {
+        let name = self.name_ref(ev[0].name);
         self.sess.clear();
         let mut k = 0;
         let n = ev.len();

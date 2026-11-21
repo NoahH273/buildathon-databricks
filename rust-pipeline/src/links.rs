@@ -15,33 +15,29 @@ pub struct LinkRec {
     pub rb: u64,
 }
 
-/// user hash -> component index, partitioned by the top LB bits of the hash.
+/// Bits of the user hash kept in a slot; the rest of the slot holds component + 1.
+const FP_BITS: u32 = 40;
+const FP_MASK: u64 = (1 << FP_BITS) - 1;
+pub const MAX_COMPS: usize = (1 << (64 - FP_BITS)) - 2;
+
+/// user hash -> component index, partitioned by the top LB bits of the hash. A slot packs
+/// (component + 1) << 40 | low 40 hash bits; the home slot comes from the hash bits below the
+/// partition bits, so a false match needs two hashes that agree on 40 bits *and* meet in one
+/// probe run (about 2^-40 per probe).
 pub struct LinkMap {
-    slots: Vec<[u64; 2]>,
-    meta: [(u32, u32); NP], // (offset, mask)
+    slots: Vec<u64>,
+    meta: [(u32, u32); NP], // (offset, capacity)
 }
 
 impl LinkMap {
     #[inline(always)]
-    fn nz(k: u64) -> u64 {
-        if k == 0 {
-            1
-        } else {
-            k
-        }
-    }
-    #[inline(always)]
-    fn home(k: u64) -> usize {
-        (k.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 24) as usize
-    }
-    #[inline(always)]
     fn slot_index(&self, k: u64) -> (usize, usize, usize) {
-        let (off, mask) = self.meta[(k >> (64 - LB)) as usize];
-        (off as usize, mask as usize, Self::home(k) & mask as usize)
+        let (off, cap) = self.meta[(k >> (64 - LB)) as usize];
+        let home = ((((k << LB) >> 32) * cap as u64) >> 32) as usize;
+        (off as usize, cap as usize, home)
     }
     #[inline(always)]
     pub fn prefetch(&self, k: u64) {
-        let k = Self::nz(k);
         let (off, _, i) = self.slot_index(k);
         unsafe {
             std::arch::x86_64::_mm_prefetch(
@@ -52,17 +48,20 @@ impl LinkMap {
     }
     #[inline(always)]
     pub fn get(&self, k: u64) -> Option<u64> {
-        let k = Self::nz(k);
-        let (off, mask, mut i) = self.slot_index(k);
+        let (off, cap, mut i) = self.slot_index(k);
+        let fp = k & FP_MASK;
         loop {
             let s = unsafe { *self.slots.get_unchecked(off + i) };
-            if s[0] == k {
-                return Some(s[1]);
-            }
-            if s[0] == 0 {
+            if s == 0 {
                 return None;
             }
-            i = (i + 1) & mask;
+            if s & FP_MASK == fp {
+                return Some((s >> FP_BITS) - 1);
+            }
+            i += 1;
+            if i == cap {
+                i = 0;
+            }
         }
     }
     /// Person key and name word for a user hash and that user's own name ref.
@@ -264,12 +263,13 @@ where
     // L8: partitioned probe table
     let mut meta = [(0u32, 0u32); NP];
     let mut total = 0usize;
+    assert!(names.len() <= MAX_COMPS, "too many linked components");
     for p in 0..NP {
-        let cap = ((parts[p].hashes.len().max(4) * 7) / 4).next_power_of_two();
-        meta[p] = (total as u32, (cap - 1) as u32);
+        let cap = parts[p].hashes.len() * 8 / 5 + 16;
+        meta[p] = (total as u32, cap as u32);
         total += cap;
     }
-    let mut slots: Vec<[u64; 2]> = vec![[0, 0]; total];
+    let mut slots: Vec<u64> = vec![0; total];
     {
         let sp = SyncPtr(slots.as_mut_ptr());
         let next = std::sync::atomic::AtomicUsize::new(0);
@@ -286,18 +286,20 @@ where
                     if p >= NP {
                         break;
                     }
-                    let (off, mask) = meta[p];
-                    for (local, &h) in parts[p].hashes.iter().enumerate() {
-                        let k = LinkMap::nz(h);
-                        let mut i = LinkMap::home(k) & mask as usize;
-                        let v = comp_of_node[node_off[p] as usize + local] as u64;
+                    let (off, cap) = meta[p];
+                    for (local, &k) in parts[p].hashes.iter().enumerate() {
+                        let mut i = ((((k << LB) >> 32) * cap as u64) >> 32) as usize;
+                        let v = ((comp_of_node[node_off[p] as usize + local] as u64 + 1) << FP_BITS) | (k & FP_MASK);
                         loop {
                             let slot = unsafe { &mut *sp.0.add(off as usize + i) };
-                            if slot[0] == 0 {
-                                *slot = [k, v];
+                            if *slot == 0 {
+                                *slot = v;
                                 break;
                             }
-                            i = (i + 1) & mask as usize;
+                            i += 1;
+                            if i == cap as usize {
+                                i = 0;
+                            }
                         }
                     }
                 });
