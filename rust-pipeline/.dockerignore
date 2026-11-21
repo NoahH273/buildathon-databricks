@@ -1,0 +1,8 @@
+target
+dev
+out*
+scratch
+bench*
+*.log
+*.tar
+.git
