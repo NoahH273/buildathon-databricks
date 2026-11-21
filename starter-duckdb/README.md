@@ -1,16 +1,20 @@
-# Shopping Sessions: DuckDB baseline
+# Shopping Sessions: Rust–DuckDB hybrid
 
-This baseline implements `rules.md` and writes `user_daily` and `campaign_daily` as Parquet. It builds a `linux/amd64` image with DuckDB and runs inside the scorer's container limits.
+This implementation follows `duckdb-rust-hybrid-spec.md` and the authoritative `rules.md`. Rust handles ingestion and attribution; DuckDB handles global event deduplication, sessions, user totals, and final Parquet output. The image targets `linux/amd64` and runs without network access.
 
 If this starter and `rules.md` ever disagree, `rules.md` wins. Ask the organizers if `rules.md` leaves you unsure.
 
 ## Implementation
 
-`pipeline/pipeline.py` streams every input part through a strict binary CSV validator, preserving spaces, quoted empty values, and carriage returns. Valid rows are staged under `SCRATCH_DIR`; reversible escaping prevents DuckDB's CSV reader from treating carriage returns as line endings. Linked IDs are resolved with union by size and path compression, tracking each component's byte-wise smallest ID separately.
+`rust/` builds `shopping-hybrid`, with independent `ingest` and `attribute` subcommands. Ingestion uses a shared exact CSV parser, byte-preserving linked-ID resolution, checked integer timestamps/prices, and parallel file scheduling with the largest files first. It writes Snappy Parquet batches bounded by 32,768 rows or about 8 MiB, flushing the row group at each batch. Invalid event candidates retain their ID, ingest time, and validity flag, so they can still win deduplication.
 
-`pipeline/pipeline.sql` handles deduplication before validation, strict timestamps, late events, sessions, categories, and both daily aggregates. Last-click credit uses an ASOF join after resolving timestamp ties. Assists use merged seven-day intervals per person and campaign to avoid expanding repeated clicks into duplicate session assists. Temporary files are removed when the run finishes.
+`pipeline/pipeline.py` orchestrates separate Rust and DuckDB phases under per-run scratch. `pipeline/pipeline.sql` materializes session and user stages in a file-backed DuckDB database. The default event winner uses a non-null packed struct with `arg_min`; `HYBRID_DEDUP=row_number` selects the reference plan. Session windows share the exact `(event_ms, event_id)` ordering.
 
-Build the image and test against all 36 edge-case fixtures and the 1M-event dev set before submitting. Local dev timings are not scorer timings.
+DuckDB exports numeric-person session/click buckets once per relation and closes before Rust attribution starts. Rust uses compact sortable records and a click-ID byte arena. A single sweep computes last-click credit and campaign interval unions; binary searches and occupied-day ranges count assists without materializing session–campaign pairs. Bucket admission uses footer estimates and bounded worker reservations, then checks vector/arena growth and per-person metric workspace before publishing a shard. Oversized buckets are deferred, spill-sorted by DuckDB, and processed one at a time using bounded readers and current-person session state. Atomic per-bucket metric files prevent duplicate contributions on retry.
+
+Build and test against all 36 fixtures and the public dev answer before submitting. Local timings are not scorer timings. The previous verified baseline remains available in Git history and can be built as a separate image for differential comparisons.
+
+See [measured results and next improvements](HYBRID_RESULTS.md) for native/container acceptance, repeated baseline comparisons, and the profiling breakdown.
 
 ## Run and test locally
 
@@ -39,14 +43,38 @@ If your laptop cannot spare 8 cores and 24 GB, run with lower limits using `make
 To iterate without Docker:
 
 ```sh
-pip install duckdb==1.5.6
+pip install -r requirements.txt polars
+cargo test --locked --manifest-path rust/Cargo.toml
+cargo build --release --locked --manifest-path rust/Cargo.toml
+export HYBRID_BIN="$PWD/rust/target/release/shopping-hybrid"
+# If CARGO_TARGET_DIR is configured, use its actual release binary instead.
+export SCRATCH_DIR="$(mktemp -d)"
 python3 scripts/run_fixtures.py fixtures -- python3 pipeline/pipeline.py
 python3 -m unittest discover -s tests -v
 ```
 
-The additional regression tests cover typed empty outputs, carriage returns and literal percent escapes in IDs, an 800-link chain with an unused smallest ID, overlapping assist intervals, and inclusive seven-day boundaries. The fixture checker also needs `polars`; the pipeline and additional tests need only DuckDB.
+The Rust tests include exact CSV/timestamp cases, long unordered link chains, and 150 seeded attribution timelines checked against brute force. Python regressions exercise byte-preserving Parquet staging, invalid earliest candidates, alternative deduplication plans, partition counts, multi-file buckets, absent clicks, forced sorted fallback, and typed empty outputs. The fixture checker needs `polars`; the pipeline uses only the pinned DuckDB Python dependency plus the compiled Rust binary. Arrow/Parquet, Rayon, and JSON dependencies are pinned in Cargo and `Cargo.lock`.
 
-For repeated performance measurements, retained artifacts, and optional stage profiling, use the language-independent [testing harness](../testing/README.md). From the repository root, `make benchmark-duckdb DEV=/path/to/dev` runs the fixtures and benchmarks against the published `dev-answer/`. Checkpoints are enabled only in separate profiling runs; the measured baseline keeps its single SQL execution path.
+For repeated measurements and retained artifacts, use the language-independent [testing harness](../testing/README.md). From the repository root:
+
+```sh
+HYBRID_BIN=/absolute/path/to/shopping-hybrid python3 testing/harness.py \
+  --name rust-duckdb-hybrid --benchmark dev-1m /path/to/dev dev-answer \
+  --repetitions 5 --profile-runs 2 --cpus 4 --mem-gb 8 \
+  -- python3 starter-duckdb/pipeline/pipeline.py
+```
+
+Checkpoints and diagnostic queries run only in separate profiling invocations. The official measured path has no checkpoint writes or diagnostic counting queries. Profile metrics include candidate counts, ingest subphase durations, handoff bytes, largest in-memory bucket/person group, merged interval count, deferred buckets, and scratch sizes observed at phase boundaries. These scratch observations are a lower bound on the true instantaneous peak. Container adapter profiles additionally retain sampled Docker memory/CPU statistics; samples can miss short peaks and never run during official measurements.
+
+| Environment variable | Default / behavior |
+| --- | --- |
+| `HYBRID_BIN` | `/app/bin/shopping-hybrid`; set explicitly for native runs |
+| `HYBRID_BUCKETS` | One for source data below 8 MiB; otherwise up to `min(NCPU, 16)` |
+| `HYBRID_MEMORY_BYTES` | 65% of `MEM_GB`, for ordinary attribution admission and allocations |
+| `HYBRID_DEDUP` | `arg_min`; optional `row_number` reference |
+| `HYBRID_KEEP_WORK=1` | Keep the scratch database and interchange files for inspection |
+
+The attribution reservation is conservative, not an OS heap cap. It includes vector/arena capacities, decoded batches, pending interval state, and an allowance for metrics and sorting. The sorted path avoids whole-bucket allocations but still needs Arrow decoder buffers, aggregate counters, and the current person's session starts; artificially tiny budgets used to force that path are not a hard RSS bound. Container memory limits remain the enforcement mechanism. All bucket counts and deduplication options preserve the same output contract.
 
 ## Submitting and scoring
 
@@ -84,8 +112,9 @@ Scorers are Google Cloud n2 Intel Xeon machines, Cascade Lake or newer, with AVX
 
 ## Files in this starter
 
-- `pipeline/pipeline.py` parses inputs, resolves linked IDs, and runs the pipeline.
-- `pipeline/pipeline.sql` implements the DuckDB transformations.
+- `pipeline/pipeline.py` orchestrates Rust, DuckDB, fallback, and final output.
+- `pipeline/pipeline.sql` implements DuckDB sessions and user totals.
+- `rust/` contains parsing, typed Parquet exchange, attribution, and focused tests.
 - `tests/` contains additional end-to-end regressions.
 - `Dockerfile` builds a `linux/amd64` image for the Intel Xeon scorers.
 - `fixtures/` holds the 36 edge cases, each an `input/` folder and the `expected/` tables. In this monorepo they live in `../../fixtures`; copy them in when publishing the starter as its own repo.

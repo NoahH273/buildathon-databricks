@@ -6,7 +6,11 @@ set -euo pipefail
 image="$1"
 shift
 container="shopping-test-${BASHPID}-${RANDOM}"
-cleanup() { docker rm -f "$container" >/dev/null 2>&1 || true; }
+monitor_pid=""
+cleanup() {
+    if [[ -n "$monitor_pid" ]]; then kill "$monitor_pid" >/dev/null 2>&1 || true; fi
+    docker rm -f "$container" >/dev/null 2>&1 || true
+}
 trap cleanup EXIT
 trap 'exit 143' TERM
 trap 'exit 130' INT
@@ -24,4 +28,18 @@ docker run --name "$container" --rm --platform linux/amd64 \
     -e DATA_DIR=/data -e OUTPUT_DIR=/output -e SCRATCH_DIR=/scratch -e HOME=/scratch \
     -e NCPU="$NCPU" -e MEM_GB="$MEM_GB" "${profile_args[@]}" "$image" "$@" &
 runner_pid=$!
+if [[ "${CHECKPOINTS_ENABLED:-0}" == 1 && -n "${CHECKPOINTS_FILE:-}" ]]; then
+    # Diagnostic samples only. Never run a monitor in official measurements.
+    (
+        for attempt in {1..100}; do
+            if docker inspect "$container" >/dev/null 2>&1; then
+                # --no-stream avoids ANSI screen-refresh bytes in JSONL files.
+                while docker stats --no-stream --no-trunc --format '{{json .}}' "$container"; do :; done
+                exit 0
+            fi
+            sleep 0.02
+        done
+    ) >"$(dirname "$CHECKPOINTS_FILE")/container-stats.jsonl" 2>"$(dirname "$CHECKPOINTS_FILE")/container-stats.stderr.log" &
+    monitor_pid=$!
+fi
 wait "$runner_pid"

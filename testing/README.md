@@ -1,5 +1,7 @@
 # Shopping Sessions testing harness
 
+The current `starter-duckdb/` entry point is the Rust–DuckDB hybrid; build its binary and export `HYBRID_BIN` for native runs. The verified original baseline remains available at revision `fbcef8c` for comparisons. The harness command contract is identical for both implementations.
+
 The harness runs any implementation as an external command. There are no implementation imports, language bindings, or engine dependencies: Python, Rust, C++, JVM programs, shell launchers, and containers use the same input/output contract from `../rules.md`.
 
 The harness needs Python 3.10+ on Linux/macOS and Polars for Parquet validation. The tested dependency is pinned separately from implementation dependencies:
@@ -11,7 +13,7 @@ python3 -m unittest discover -s testing/tests -v
 
 Run these commands from the repository root. Installing DuckDB is necessary only for the DuckDB implementation.
 
-## Run fixtures and benchmark the DuckDB baseline
+## Run fixtures and benchmark the hybrid
 
 Generate the public seed-1 dataset if it is not already available. `dev-answer/` contains its published answer:
 
@@ -21,8 +23,10 @@ cargo build --release
 cd ..
 generator/target/release/generate --seed 1 --events 1000000 --clicks 250000 --output datasets/dev
 python3 -m pip install -r starter-duckdb/requirements.txt
+cargo build --release --locked --manifest-path starter-duckdb/rust/Cargo.toml
+export HYBRID_BIN="$PWD/starter-duckdb/rust/target/release/shopping-hybrid"
 python3 testing/harness.py \
-  --name duckdb-baseline \
+  --name rust-duckdb-hybrid \
   --benchmark dev-1m datasets/dev dev-answer \
   --repetitions 5 --warmups 1 --profile-runs 2 \
   --cpus 4 --mem-gb 8 \
@@ -68,16 +72,18 @@ The generic container adapter enforces CPU/RAM limits, removes network access, m
 python3 testing/harness.py \
   --name container-baseline --resource-mode wall-only \
   --benchmark dev-1m datasets/dev dev-answer --cpus 4 --mem-gb 8 \
-  -- bash testing/docker_adapter.sh shopping-sessions:duckdb-baseline
+  -- bash testing/docker_adapter.sh shopping-sessions:hybrid
 ```
 
 Use wall-only mode with Docker or remote launchers: host CLI CPU/RSS would not represent the implementation. Container wall times include container startup/cleanup and must be compared to other implementations using the same execution mode. The container adapter requires Docker on the local host; force-killing an arbitrary remote launcher cannot reliably clean up work in another daemon or machine.
+
+Only in profiling runs, the Docker adapter also writes sampled `docker stats` output to `profiling/container-stats.jsonl`. This is diagnostic container memory/CPU information, not an exact memory high-water mark; short peaks may be missed. No monitor runs in warmups, fixtures, or official measured samples.
 
 ## Optional checkpoints without contaminating benchmark times
 
 **Checkpoint collection never runs in the official timing samples.** The harness explicitly removes an inherited `CHECKPOINTS_FILE` and sets `CHECKPOINTS_ENABLED=0` during fixtures, warmups, and measurements. Only additional profiling invocations receive a destination file. Profiling durations never contribute to median, P95, throughput, or official CPU/RSS summaries. Checkpoints are optional; implementations without them are tested normally.
 
-Instrumentation has overhead. Implementations must use an uninstrumented execution path when checkpoints are disabled, rather than recording and throwing events away. The DuckDB baseline keeps its original single SQL execution in this path; splitting SQL into stages and writing JSONL happen only in profiling runs. For compiled programs needing zero instrumentation in their measured binary, supply a separate instrumented executable:
+Instrumentation has overhead. Implementations must use an uninstrumented execution path when checkpoints are disabled, rather than recording and throwing events away. The hybrid executes each normal SQL stage group without checkpoint callbacks on this path; splitting those groups at diagnostic markers and writing JSONL happen only in profiling runs. For compiled programs needing zero instrumentation in their measured binary, supply a separate instrumented executable:
 
 ```sh
 python3 testing/harness.py \
