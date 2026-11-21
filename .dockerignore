@@ -1,0 +1,7 @@
+# Only the locked Rust crate is needed to build the submission image.
+**
+!rust-pipeline/
+!rust-pipeline/Cargo.toml
+!rust-pipeline/Cargo.lock
+!rust-pipeline/src/
+!rust-pipeline/src/**

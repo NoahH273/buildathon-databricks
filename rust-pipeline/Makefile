@@ -9,15 +9,16 @@ DEV ?= dev
 OUT ?= out
 ANSWER ?= ../dev-answer
 export IMAGE PLATFORM CPUS MEM
-.PHONY: build test fixtures native-fixtures dev run-dev check-dev
+.PHONY: build test fixtures native-fixtures dev run-dev check-dev profile-build
 build:
 	docker buildx build --platform $(PLATFORM) --load -t $(IMAGE) .
 test:
 	cargo fmt --check
 	cargo test --locked
-	cargo build --release --locked
+	cargo test --locked --features profiling
+	cargo build --release --locked --no-default-features
 native-fixtures:
-	cargo build --release --locked
+	cargo build --release --locked --no-default-features
 	python3 $(HARNESS)/run_fixtures.py $(FIXTURES) -- ./target/release/shopping-sessions
 fixtures: build
 	python3 $(HARNESS)/run_fixtures.py $(FIXTURES) -- sh $(HARNESS)/docker_run.sh
@@ -28,3 +29,7 @@ run-dev: build
 	time sh $(HARNESS)/docker_run.sh $(DEV) $(OUT)
 check-dev:
 	python3 $(HARNESS)/compare.py $(OUT) $(ANSWER)
+
+# Profiling is an explicit development build; it never replaces the submission binary.
+profile-build:
+	cargo build --release --locked --features profiling --target-dir target/profiling

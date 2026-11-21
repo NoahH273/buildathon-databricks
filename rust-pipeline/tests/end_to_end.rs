@@ -157,6 +157,7 @@ fn dedup_cross_person_midnight_category_ties_and_invalid_utf8() {
     assert_eq!(u.column_by_name("user_id").unwrap().null_count(), 0);
 }
 
+#[cfg(feature = "profiling")]
 #[test]
 fn detailed_checkpoints_account_for_rows_and_respect_profile_gate() {
     let w = dataset();
@@ -238,5 +239,40 @@ fn detailed_checkpoints_account_for_rows_and_respect_profile_gate() {
             record["metrics"].as_object().unwrap().is_empty(),
             "coarse mode must omit detailed counters"
         );
+    }
+}
+
+#[cfg(not(feature = "profiling"))]
+#[test]
+fn submission_ignores_all_profiling_flags_and_paths() {
+    let w = dataset();
+    let checkpoint = w.0.join("should-not-exist.jsonl");
+    for path in [
+        &checkpoint,
+        w.0.join("missing-parent/checkpoint.jsonl").as_path(),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_shopping-sessions"))
+            .env("DATA_DIR", &w.0)
+            .env("OUTPUT_DIR", w.0.join("out"))
+            .env("CHECKPOINTS_ENABLED", "1")
+            .env("CHECKPOINTS_FILE", path)
+            .env("DIAGNOSTICS", "1")
+            .env("EVENT_PROFILE_DETAIL", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!path.exists());
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(
+            !stderr.contains("phase ")
+                && !stderr.contains("phase_detail")
+                && !stderr.contains("elapsed=")
+        );
+        assert!(read(&w.0, "user_daily").is_empty());
+        assert!(read(&w.0, "campaign_daily").is_empty());
     }
 }

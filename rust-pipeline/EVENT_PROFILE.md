@@ -1,5 +1,7 @@
 # Detailed event-phase profiling
 
+Historical validation/profiling record. Current root packaging and the submission binary with checkpointing compiled out are documented in `SUBMISSION.md`. Profiling now requires an explicit `--features profiling` development build.
+
 The added checkpoints split the two expensive event phases into exclusive operation buckets. All changes stay under `rust-pipeline/`; the shared harness and test oracle are unchanged. `profile.rs` implements const-specialized timing, `csv.rs` adds an instrumented scan using the same strict parser, `events.rs` times dedup/validation operations, and `main.rs` puts the breakdown into the existing parent checkpoint's `metrics`. The harness still sees a monotonic, non-overlapping parent timeline and preserves nested data in `results.json`.
 
 ## Main findings

@@ -1,5 +1,6 @@
 //! Exclusive operation wall times include clock-read cost, and run only in detailed profiles.
 //! Untimed control flow and counter bookkeeping remain in the parent phase's residual.
+#[cfg(feature = "profiling")]
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy)]
@@ -25,6 +26,7 @@ pub enum Step {
     RawWinnerRelease,
     WinnerTableRelease,
 }
+#[cfg(feature = "profiling")]
 const NAMES: [&str; 19] = [
     "file_discovery_open_header",
     "buffered_line_read",
@@ -48,7 +50,9 @@ const NAMES: [&str; 19] = [
 ];
 #[derive(Default)]
 pub struct Breakdown {
+    #[cfg(feature = "profiling")]
     elapsed: [Duration; NAMES.len()],
+    #[cfg(feature = "profiling")]
     calls: [u64; NAMES.len()],
 }
 impl Breakdown {
@@ -58,17 +62,19 @@ impl Breakdown {
         step: Step,
         operation: impl FnOnce() -> T,
     ) -> T {
+        #[cfg(feature = "profiling")]
         if ENABLED {
             let started = Instant::now();
             let value = operation();
             let elapsed = started.elapsed();
             self.elapsed[step as usize] += elapsed;
             self.calls[step as usize] += 1;
-            value
-        } else {
-            operation()
+            return value;
         }
+        let _ = step;
+        operation()
     }
+    #[cfg(feature = "profiling")]
     pub fn metrics(&self, parent_seconds: f64) -> serde_json::Value {
         let timed: f64 = self.elapsed.iter().map(Duration::as_secs_f64).sum();
         let steps: Vec<_> = NAMES.iter().enumerate().filter(|(i,_)|self.calls[*i] > 0).map(|(i,name)| {
