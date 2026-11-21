@@ -144,6 +144,22 @@ pub fn advise_huge<T>(v: &Vec<T>) {
     let _ = v;
 }
 
+/// Prefault a chunk with one madvise instead of a fault per page (Linux 5.14+, else no-op).
+fn populate(data: &[u8], start: usize, end: usize) {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        const MADV_POPULATE_READ: libc::c_int = 22;
+        let base = data.as_ptr() as usize;
+        let s = (base + start) & !4095;
+        let e = (base + end.min(data.len()) + 4095) & !4095;
+        if e > s {
+            libc::madvise(s as *mut libc::c_void, e - s, MADV_POPULATE_READ);
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (data, start, end);
+}
+
 #[inline(always)]
 fn prefetch(p: *const u8) {
     unsafe { std::arch::x86_64::_mm_prefetch(p as *const i8, std::arch::x86_64::_MM_HINT_T0) };
@@ -399,7 +415,9 @@ fn main() {
                 if i >= ev_chunks.len() {
                     break;
                 }
-                parse_events(&ctx, ev_chunks[i], &mut evb);
+                let c = ev_chunks[i];
+                populate(ctx.data(c.fid as usize), c.start, c.end + 4096);
+                parse_events(&ctx, c, &mut evb);
             }
             evb.finish()
         });
@@ -416,7 +434,9 @@ fn main() {
             if i >= cl_chunks.len() {
                 break;
             }
-            parse_clicks(&ctx, &linked, cl_chunks[i], &mut clb);
+            let c = cl_chunks[i];
+            populate(ctx.data(c.fid as usize), c.start, c.end + 4096);
+            parse_clicks(&ctx, &linked, c, &mut clb);
         }
         clb.finish()
     });
