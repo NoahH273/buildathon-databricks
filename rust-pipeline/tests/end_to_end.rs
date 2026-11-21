@@ -156,3 +156,87 @@ fn dedup_cross_person_midnight_category_ties_and_invalid_utf8() {
     );
     assert_eq!(u.column_by_name("user_id").unwrap().null_count(), 0);
 }
+
+#[test]
+fn detailed_checkpoints_account_for_rows_and_respect_profile_gate() {
+    let w = dataset();
+    // Two copies of one event; the invalid earliest winner must still be retained then rejected.
+    fs::write(w.0.join("events/part.csv"), "event_id,user_id,ts,ingest_ts,event_type,product_id,price_cents\ne1,u1,bad,2028-02-28T00:01:00Z,view,p1,\ne1,u2,2028-02-28T00:00:00Z,2028-02-28T00:02:00Z,view,p1,\nmalformed\n").unwrap();
+    let checkpoints = w.0.join("checkpoints.jsonl");
+    let launch = |enabled: &str, detail: &str| {
+        assert!(
+            Command::new(env!("CARGO_BIN_EXE_shopping-sessions"))
+                .env("DATA_DIR", &w.0)
+                .env("OUTPUT_DIR", w.0.join("out"))
+                .env("CHECKPOINTS_ENABLED", enabled)
+                .env("EVENT_PROFILE_DETAIL", detail)
+                .env("CHECKPOINTS_FILE", &checkpoints)
+                .env_remove("DIAGNOSTICS")
+                .status()
+                .unwrap()
+                .success()
+        );
+    };
+    let gated = Command::new(env!("CARGO_BIN_EXE_shopping-sessions"))
+        .env("DATA_DIR", &w.0)
+        .env("OUTPUT_DIR", w.0.join("out"))
+        .env("CHECKPOINTS_ENABLED", "0")
+        .env("EVENT_PROFILE_DETAIL", "1")
+        .env("CHECKPOINTS_FILE", &checkpoints)
+        .env("DIAGNOSTICS", "1")
+        .output()
+        .unwrap();
+    assert!(gated.status.success());
+    assert!(
+        !String::from_utf8(gated.stderr)
+            .unwrap()
+            .contains("phase_detail"),
+        "an explicit benchmark gate must override inherited diagnostic flags"
+    );
+    launch("0", "1");
+    assert!(
+        !checkpoints.exists(),
+        "disabled profiling must not create a file"
+    );
+    launch("1", "1");
+    let records: Vec<serde_json::Value> = fs::read_to_string(&checkpoints)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let mut previous = 0.0;
+    for record in &records {
+        let elapsed = record["elapsed_seconds"].as_f64().unwrap();
+        assert!(elapsed >= previous);
+        previous = elapsed;
+    }
+    for (phase, step, calls) in [
+        ("events_parse_dedup", "csv_structure_utf8", 3),
+        ("events_parse_dedup", "dedup_hash_lookup_compare", 2),
+        ("events_validate_resolve", "winner_csv_reparse", 1),
+        ("events_validate_resolve", "raw_winner_release", 1),
+    ] {
+        let metrics = &records.iter().find(|r| r["name"] == phase).unwrap()["metrics"];
+        let subphases = metrics["subphases"].as_array().unwrap();
+        assert_eq!(
+            subphases.iter().find(|r| r["name"] == step).unwrap()["calls"],
+            calls
+        );
+        let sum: f64 = subphases
+            .iter()
+            .map(|r| r["seconds"].as_f64().unwrap())
+            .sum();
+        let wall = metrics["phase_seconds"].as_f64().unwrap();
+        assert!(sum <= wall);
+        assert!((sum + metrics["unattributed_seconds"].as_f64().unwrap() - wall).abs() < 1e-9);
+    }
+    assert!(read(&w.0, "user_daily").is_empty());
+    launch("1", "0");
+    for line in fs::read_to_string(&checkpoints).unwrap().lines() {
+        let record: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert!(
+            record["metrics"].as_object().unwrap().is_empty(),
+            "coarse mode must omit detailed counters"
+        );
+    }
+}

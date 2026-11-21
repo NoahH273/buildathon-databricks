@@ -64,6 +64,40 @@ pub fn read<const N: usize>(
     Ok(())
 }
 
+/// Same parser and LF-only record boundaries as `read`, with exclusive I/O/parse timings.
+/// Kept separate so ordinary input scans do not execute per-row clocks or profile branches.
+pub fn read_profiled<const N: usize>(
+    path: &Path,
+    profile: &mut crate::profile::Breakdown,
+    mut accept: impl FnMut([&str; N], &[u8], &mut crate::profile::Breakdown),
+) -> io::Result<()> {
+    use crate::profile::Step;
+    let (mut reader, mut line) =
+        profile.measure::<true, _>(Step::FileSetup, || -> io::Result<_> {
+            let mut reader = BufReader::with_capacity(1 << 20, File::open(path)?);
+            let mut line = Vec::new();
+            reader.read_until(b'\n', &mut line)?;
+            Ok((reader, line))
+        })?;
+    loop {
+        let bytes = profile.measure::<true, _>(Step::BufferedLineRead, || {
+            line.clear();
+            let bytes = reader.read_until(b'\n', &mut line)?;
+            if line.last() == Some(&b'\n') {
+                line.pop();
+            }
+            Ok::<_, io::Error>(bytes)
+        })?;
+        if bytes == 0 {
+            break;
+        }
+        if let Some(fields) = profile.measure::<true, _>(Step::CsvStructureUtf8, || parse(&line)) {
+            accept(fields, &line, profile);
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

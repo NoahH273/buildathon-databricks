@@ -45,7 +45,26 @@ python3 testing/harness.py --name rust-native \
   -- ./rust-pipeline/target/release/shopping-sessions
 ```
 
-The harness checks schemas, exact rows, duplicate keys, nullability and conservation invariants on every run. It records wall time, CPU and per-process peak RSS for native runs; its container mode uses wall-only measurements. `CHECKPOINTS_ENABLED=1` plus `CHECKPOINTS_FILE` enables its JSONL phase profiling. `DIAGNOSTICS=1` prints phase durations to stderr for manual runs. Measured harness runs disable checkpoint recording. `/usr/bin/time` is not required.
+The harness checks schemas, exact rows, duplicate keys, nullability and conservation invariants on every run. It records wall time, CPU and per-process peak RSS for native runs; its container mode uses wall-only measurements. `CHECKPOINTS_ENABLED=1` plus `CHECKPOINTS_FILE` enables its JSONL phase profiling. `DIAGNOSTICS=1` prints phase durations and detailed event metrics to stderr for manual runs. Measured harness runs disable checkpoint recording. `/usr/bin/time` is not required.
+
+### Detailed event checkpoints
+
+Profiling now subdivides `events_parse_dedup` and `events_validate_resolve`. Their existing JSONL records include `metrics.subphases` entries with exclusive `seconds` and operation `calls`, plus phase wall time and an unattributed residual. It times file discovery/open/header, buffered LF reads, UTF-8/CSV parsing, ingest timestamps, hash lookup/comparison, winner allocation/copy, index insert/replace/growth, winner iteration/reparse, required IDs, event timestamps/window, type/price, lateness, identity resolution, product lookup, compact-event append and raw/index cleanup.
+
+Detailed timers turn on automatically for the harness's profiling runs or `DIAGNOSTICS=1`. Set `EVENT_PROFILE_DETAIL=0` for coarse checkpoints only. Explicit `CHECKPOINTS_ENABLED=0` overrides detailed diagnostics, including an inherited `DIAGNOSTICS=1`. Normal measured runs select a separate const specialization with per-operation clocks and counter updates compiled out. The shared harness is unchanged: nested subphase metrics are retained in `results.json`, while its existing report continues to show parent phases.
+
+```sh
+# From repository root, use three profiles to compare subphase medians:
+python3 testing/harness.py --name rust-details \
+  --benchmark dev-1m rust-pipeline/dev dev-answer \
+  --warmups 1 --repetitions 3 --profile-runs 3 --cpus 5 --mem-gb 24 \
+  --artifacts rust-pipeline/bench-artifacts \
+  -- ./rust-pipeline/target/release/shopping-sessions
+python3 rust-pipeline/scripts/summarize_event_profiles.py \
+  rust-pipeline/bench-artifacts/rust-details-*/results.json
+```
+
+Detailed profiling performs clock reads for every measured operation on every row. Its timings include clock-read cost and perturb fast operations. The residual contains untimed control flow and timer bookkeeping; it is not a pure overhead estimate. Compare ordinary/coarse/detailed runs separately, and do not treat a detailed run as normal runtime. Results are in `EVENT_PROFILE.md`.
 
 ## Submission packaging
 

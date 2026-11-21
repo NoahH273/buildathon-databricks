@@ -1,5 +1,7 @@
 # Validation and delivery record
 
+This records the initial implementation at `819a52e`. For the later detailed-checkpoint changes, current image ID, and new measurements, see `EVENT_PROFILE.md`.
+
 The implementation, lockfile, tests and packaging are confined to `rust-pipeline/`. No shared harness, generator source, fixture, expected answer, starter implementation, or root configuration was changed. Branch `rust-pipeline` starts at `fbcef8c` (current `origin/main` when fetched).
 
 ## Results

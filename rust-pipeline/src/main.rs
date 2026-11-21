@@ -4,6 +4,7 @@ mod csv;
 mod events;
 mod ids;
 mod parquet;
+mod profile;
 mod sessions;
 mod timestamp;
 use ids::{Interner, People};
@@ -18,21 +19,26 @@ struct Timer {
 }
 impl Timer {
     fn mark(&mut self, phase: &str) -> Result<()> {
+        self.mark_detailed(phase, None)
+    }
+    fn mark_detailed(&mut self, phase: &str, detail: Option<&profile::Breakdown>) -> Result<()> {
         if !self.enabled && self.checkpoints.is_none() {
             return Ok(());
         }
         let now = Instant::now();
+        let seconds = now.duration_since(self.last).as_secs_f64();
+        let metrics = detail.map(|detail| detail.metrics(seconds));
         if self.enabled {
-            eprintln!(
-                "phase {phase}: {:.6}s",
-                now.duration_since(self.last).as_secs_f64()
-            );
+            eprintln!("phase {phase}: {:.6}s", seconds);
+            if let Some(metrics) = &metrics {
+                eprintln!("phase_detail {phase}: {metrics}");
+            }
         }
         if let Some(file) = &mut self.checkpoints {
             writeln!(
                 file,
                 "{}",
-                serde_json::json!({"name":phase,"elapsed_seconds":now.duration_since(self.started).as_secs_f64()})
+                serde_json::json!({"name":phase,"elapsed_seconds":now.duration_since(self.started).as_secs_f64(),"metrics":metrics.unwrap_or_else(||serde_json::json!({}))})
             )?;
         }
         self.last = now;
@@ -68,6 +74,11 @@ fn run() -> Result<()> {
             None
         },
     };
+    // Dispatch once per phase; const specialization removes per-row clocks and
+    // profile branches from ordinary measured runs. Coarse-only profiles use 0.
+    let detailed_events = (timer.enabled || timer.checkpoints.is_some())
+        && env::var("CHECKPOINTS_ENABLED").as_deref() != Ok("0")
+        && env::var("EVENT_PROFILE_DETAIL").as_deref() != Ok("0");
     // The implementation is serial and in-memory: NCPU/MEM_GB are resource ceilings,
     // not a promise to allocate all available resources. No runtime cache/spills.
     let manifest: serde_json::Value =
@@ -109,10 +120,23 @@ fn run() -> Result<()> {
         })?;
     }
     timer.mark("links_parse_intern_union")?;
-    let dedup = events::Dedup::read(&data)?;
-    timer.mark("events_parse_dedup")?;
-    let mut events = dedup.validate(&mut people, &products, unknown, start, end);
-    timer.mark("events_validate_resolve")?;
+    let mut detail = profile::Breakdown::default();
+    let dedup = if detailed_events {
+        events::Dedup::read::<true>(&data, &mut detail)?
+    } else {
+        events::Dedup::read::<false>(&data, &mut detail)?
+    };
+    timer.mark_detailed("events_parse_dedup", detailed_events.then_some(&detail))?;
+    let mut detail = profile::Breakdown::default();
+    let mut events = if detailed_events {
+        dedup.validate::<true>(&mut people, &products, unknown, start, end, &mut detail)
+    } else {
+        dedup.validate::<false>(&mut people, &products, unknown, start, end, &mut detail)
+    };
+    timer.mark_detailed(
+        "events_validate_resolve",
+        detailed_events.then_some(&detail),
+    )?;
     sessions::sort(&mut events);
     timer.mark("events_sort")?;
     let event_count = events.len();
