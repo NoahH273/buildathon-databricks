@@ -126,6 +126,24 @@ impl Ctx {
     }
 }
 
+/// Ask Linux to back a large, not yet touched allocation with transparent huge pages, so
+/// random probes into it do not miss the TLB. A no-op elsewhere.
+pub fn advise_huge<T>(v: &Vec<T>) {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        const H: usize = 2 << 20;
+        let p = v.as_ptr() as usize;
+        let len = v.capacity() * std::mem::size_of::<T>();
+        let s = (p + H - 1) & !(H - 1);
+        let e = (p + len) & !(H - 1);
+        if e > s {
+            libc::madvise(s as *mut libc::c_void, e - s, libc::MADV_HUGEPAGE);
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = v;
+}
+
 #[inline(always)]
 fn prefetch(p: *const u8) {
     unsafe { std::arch::x86_64::_mm_prefetch(p as *const i8, std::arch::x86_64::_MM_HINT_T0) };
@@ -358,48 +376,55 @@ fn main() {
         nthreads
     );
 
-    // ---- phase 0: links ----
-    let next = AtomicUsize::new(0);
-    let link_recs: Vec<Vec<LinkRec>> = par(nthreads, |_| {
-        let mut out = Vec::new();
-        loop {
-            let i = next.fetch_add(1, Ordering::Relaxed);
-            if i >= link_chunks.len() {
-                break;
-            }
-            parse_links(&ctx, link_chunks[i], &mut out);
-        }
-        out
-    });
-    let linked: Linked = links::build(link_recs, nthreads, |r| ctx.ref_str(r));
-    eprintln!("phase0 {:?}", t0.elapsed());
-
-    // ---- phase 1: parse events (by event_id) and clicks (by person) ----
-    let next = AtomicUsize::new(0);
+    // ---- phase 1a: events (by event_id), with the linked-ID build running alongside ----
+    let ev_chunks: Vec<Chunk> = chunks.iter().copied().filter(|c| c.kind == 2).collect();
+    let cl_chunks: Vec<Chunk> = chunks.iter().copied().filter(|c| c.kind == 1).collect();
     let per_bucket = est_events / (p1 * nthreads) + 16;
     let cl_bucket = est_clicks / (p2 * nthreads) + 16;
-    let p1_locals: Vec<(Vec<Vec<Ev1>>, Vec<Vec<Cl>>)> = par(nthreads, |_| {
-        let mut evb: Scatter<Ev1, B1> = Scatter::new(p1, per_bucket);
+    let (linked, ev_locals): (Linked, Vec<Vec<Vec<Ev1>>>) = std::thread::scope(|s| {
+        let lh = s.spawn(|| {
+            let mut out = Vec::new();
+            for &c in &link_chunks {
+                parse_links(&ctx, c, &mut out);
+            }
+            let l = links::build(vec![out], nthreads, |r| ctx.ref_str(r));
+            eprintln!("links done {:?}", t0.elapsed());
+            l
+        });
+        let next = AtomicUsize::new(0);
+        let ev = par(nthreads, |_| {
+            let mut evb: Scatter<Ev1, B1> = Scatter::new(p1, per_bucket);
+            loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                if i >= ev_chunks.len() {
+                    break;
+                }
+                parse_events(&ctx, ev_chunks[i], &mut evb);
+            }
+            evb.finish()
+        });
+        eprintln!("events parsed {:?}", t0.elapsed());
+        (lh.join().unwrap(), ev)
+    });
+
+    // ---- phase 1b: clicks (by person) ----
+    let next = AtomicUsize::new(0);
+    let cl_locals: Vec<Vec<Vec<Cl>>> = par(nthreads, |_| {
         let mut clb: Scatter<Cl, B2> = Scatter::new(p2, cl_bucket);
         loop {
             let i = next.fetch_add(1, Ordering::Relaxed);
-            if i >= chunks.len() {
+            if i >= cl_chunks.len() {
                 break;
             }
-            let c = chunks[i];
-            if c.kind == 1 {
-                parse_clicks(&ctx, &linked, c, &mut clb);
-            } else {
-                parse_events(&ctx, &linked, c, &mut evb);
-            }
+            parse_clicks(&ctx, &linked, cl_chunks[i], &mut clb);
         }
-        (evb.finish(), clb.finish())
+        clb.finish()
     });
     eprintln!("phase1 {:?}", t0.elapsed());
 
     // ---- phase 2: dedup events, repartition by person ----
     let next = AtomicUsize::new(0);
-    let n_ev1: usize = p1_locals.iter().map(|l| l.0.iter().map(|b| b.len()).sum::<usize>()).sum();
+    let n_ev1: usize = ev_locals.iter().map(|l| l.iter().map(|b| b.len()).sum::<usize>()).sum();
     let ev2_cap = n_ev1 * 5 / 4 / (p2 * nthreads) + 32;
     // A record is addressed as (source thread << SRC_SHIFT) | index within that thread's bucket.
     const SRC_SHIFT: u32 = 27;
@@ -419,10 +444,10 @@ fn main() {
             srcs.clear();
             offs.clear();
             let mut n = 0usize;
-            for l in p1_locals.iter() {
+            for l in ev_locals.iter() {
                 offs.push(n);
-                n += l.0[part].len();
-                srcs.push(&l.0[part][..]);
+                n += l[part].len();
+                srcs.push(&l[part][..]);
             }
             if n == 0 {
                 continue;
@@ -466,12 +491,17 @@ fn main() {
             }
             for (t, src) in srcs.iter().enumerate() {
                 let kp = &keep[offs[t]..offs[t] + src.len()];
-                for (r, &k) in src.iter().zip(kp.iter()) {
+                // resolve linked IDs here, prefetching the link table a few records ahead
+                const AHEAD: usize = 8;
+                for (i, (r, &k)) in src.iter().zip(kp.iter()).enumerate() {
+                    if let Some(f) = src.get(i + AHEAD) {
+                        linked.map.prefetch(f.person);
+                    }
                     if k == 0 || r.ts == INVALID {
                         continue;
                     }
-                    let person = r.person;
-                    evb.push((person >> shift2) as usize, Ev2 { person, name: r.name, ts: r.ts, pc: r.pc });
+                    let (person, name) = linked.map.resolve(r.person, r.name);
+                    evb.push((person >> shift2) as usize, Ev2 { person, name, ts: r.ts, pc: r.pc });
                 }
             }
         }
@@ -503,7 +533,7 @@ fn main() {
             }
             let q = order[i].1;
             let ev_srcs: Vec<&[Ev2]> = p2_events.iter().map(|l| &l[q][..]).collect();
-            let cl_srcs: Vec<&[Cl]> = p1_locals.iter().map(|l| &l.1[q][..]).collect();
+            let cl_srcs: Vec<&[Cl]> = cl_locals.iter().map(|l| &l[q][..]).collect();
             st.process_partition(&ctx, &ev_srcs, &cl_srcs, &mut evs, &mut cls);
         }
         let rows = st.rows;
@@ -642,11 +672,9 @@ fn parse_clicks(ctx: &Ctx, linked: &Linked, c: Chunk, out: &mut Scatter<Cl, B2>)
             return;
         }
         let fast = pos >= 16 && pos + 128 <= data.len();
-        let tsr = if fast {
-            unsafe { parse_ts_fast(data.as_ptr().add(pos + f[3].0 as usize), (f[3].1 - f[3].0) as usize) }
-        } else {
-            parse_ts(fld(data, pos, f[3]))
-        };
+        let fp = |k: usize| unsafe { data.as_ptr().add(pos + f[k].0 as usize) };
+        let fl = |k: usize| (f[k].1 - f[k].0) as usize;
+        let tsr = if fast { unsafe { parse_ts_fast(fp(3), fl(3)) } } else { parse_ts(fld(data, pos, f[3])) };
         let ts = match tsr {
             Some(t) => t - base,
             None => return,
@@ -654,11 +682,12 @@ fn parse_clicks(ctx: &Ctx, linked: &Linked, c: Chunk, out: &mut Scatter<Cl, B2>)
         if ts < 0 || ts >= hi {
             return;
         }
-        let camp = match ctx.campaigns.get(hash(fld(data, pos, f[2]))) {
+        let ch = if fast { unsafe { hash_fast(fp(2), fl(2)) } } else { hash(fld(data, pos, f[2])) };
+        let camp = match ctx.campaigns.get(ch) {
             Some(x) => x,
             None => return,
         };
-        let user = hash(fld(data, pos, f[1]));
+        let user = if fast { unsafe { hash_fast(fp(1), fl(1)) } } else { hash(fld(data, pos, f[1])) };
         linked.map.prefetch(user);
         ring.push(Cl { person: user, cid: fbase | (pos + f[0].0 as usize) as u64, ts: ts as u32, camp }, &mut done);
     });
@@ -669,7 +698,7 @@ const W_VIEW: u32 = u32::from_le_bytes(*b"view");
 const W_CART: u32 = u32::from_le_bytes(*b"cart");
 const W_PURCHASE: u64 = u64::from_le_bytes(*b"purchase");
 
-fn parse_events(ctx: &Ctx, linked: &Linked, c: Chunk, out: &mut Scatter<Ev1, B1>) {
+fn parse_events(ctx: &Ctx, c: Chunk, out: &mut Scatter<Ev1, B1>) {
     let data = ctx.data(c.fid as usize);
     let fbase = (c.fid as u64) << OFF_BITS;
     let base = ctx.base;
@@ -677,26 +706,61 @@ fn parse_events(ctx: &Ctx, linked: &Linked, c: Chunk, out: &mut Scatter<Ev1, B1>
     let hi = ctx.ev_hi as i64;
     let shift = 64 - ctx.b1;
     let base_s = base.div_euclid(1000);
-    let mut ring: Ring<Ev1> = Ring::new();
-    // `out` is shared by the ring's resolver and the invalid-row path
-    let out = std::cell::RefCell::new(out);
-    let mut done = |mut x: Ev1| {
-        let (p, nm) = linked.map.resolve(x.person, x.name);
-        x.person = p;
-        x.name = nm;
-        out.borrow_mut().push((x.eid >> shift) as usize, x);
-    };
     scan_lines::<7>(data, c.start, c.end, |pos, f| {
         if f[0].0 == f[0].1 {
             return;
         }
-        // the SIMD field parsers may read up to 16 bytes before a field and 20 after its start
-        let fast = pos >= 16 && pos + 128 <= data.len();
-        let fp = |k: usize| unsafe { data.as_ptr().add(pos + f[k].0 as usize) };
-        let fl = |k: usize| (f[k].1 - f[k].0) as usize;
+        // the SIMD field parsers may read up to 16 bytes before a field and 25 after its start
+        if pos >= 16 && pos + 128 <= data.len() {
+            let fp = |k: usize| unsafe { data.as_ptr().add(pos + f[k].0 as usize) };
+            let fl = |k: usize| (f[k].1 - f[k].0) as usize;
+            let eid = unsafe { hash_fast(fp(0), fl(0)) };
+            let ingest_ms = unsafe { parse_f1_fast(fp(3), fl(3)) }.unwrap_or(i64::MAX / 4);
+            let ingest = (ingest_ms.div_euclid(1000) - base_s).clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+            // validity without data-dependent branches: event types and timestamp forms are
+            // mixed row by row, so branching on them would mispredict
+            let tn = fl(4);
+            let tw = unsafe { (fp(4) as *const u64).read_unaligned() };
+            let four = (tn == 4) & (((tw as u32) == W_VIEW) | ((tw as u32) == W_CART));
+            let purchase = (tn == 8) & (tw == W_PURCHASE);
+            let tsr = unsafe { parse_ts_fast(fp(2), fl(2)) };
+            let ts_abs = tsr.unwrap_or(i64::MIN / 4);
+            let ts = ts_abs - base;
+            let mut valid = (f[1].0 != f[1].1)
+                & (f[5].0 != f[5].1)
+                & (four | purchase)
+                & tsr.is_some()
+                & (ts >= lo)
+                & (ts < hi)
+                & (ingest_ms - ts_abs <= DAY_MS);
+            let mut price = 0u32;
+            if purchase {
+                match unsafe { parse_price_fast(fp(6), fl(6)) } {
+                    Some(p) => price = p,
+                    None => valid = false,
+                }
+            }
+            if valid {
+                let num = unsafe { product_num(fp(5), fl(5)) };
+                let cat = ctx.category(num, fld(data, pos, f[5]));
+                let user = unsafe { hash_fast(fp(1), fl(1)) };
+                let rec = Ev1 {
+                    eid,
+                    person: user,
+                    name: fbase | (pos + f[1].0 as usize) as u64,
+                    ts: ts as u32,
+                    ingest,
+                    pc: (price << 8) | cat,
+                };
+                out.push((eid >> shift) as usize, rec);
+            } else {
+                // invalid rows still take part in dedup; they need no person
+                out.push((eid >> shift) as usize, Ev1 { eid, person: 0, name: 0, ts: INVALID, ingest, pc: 0 });
+            }
+            return;
+        }
         let eid = hash(fld(data, pos, f[0]));
-        let ingest_ms = if fast { unsafe { parse_f1_fast(fp(3), fl(3)) } } else { parse_f1(fld(data, pos, f[3])) }
-            .unwrap_or(i64::MAX / 4);
+        let ingest_ms = parse_f1(fld(data, pos, f[3])).unwrap_or(i64::MAX / 4);
         let ingest = (ingest_ms.div_euclid(1000) - base_s).clamp(i32::MIN as i64, i32::MAX as i64) as i32;
         let mut rec = Ev1 { eid, person: 0, name: 0, ts: INVALID, ingest, pc: 0 };
         'v: {
@@ -719,8 +783,7 @@ fn parse_events(ctx: &Ctx, linked: &Linked, c: Chunk, out: &mut Scatter<Ev1, B1>
             } else {
                 break 'v;
             };
-            let tsr = if fast { unsafe { parse_ts_fast(fp(2), fl(2)) } } else { parse_ts(fld(data, pos, f[2])) };
-            let ts_abs = match tsr {
+            let ts_abs = match parse_ts(fld(data, pos, f[2])) {
                 Some(t) => t,
                 None => break 'v,
             };
@@ -733,28 +796,20 @@ fn parse_events(ctx: &Ctx, linked: &Linked, c: Chunk, out: &mut Scatter<Ev1, B1>
             }
             let mut price = 0u32;
             if purchase {
-                let pr = if fast { unsafe { parse_price_fast(fp(6), fl(6)) } } else { parse_price(fld(data, pos, f[6])) };
-                price = match pr {
+                price = match parse_price(fld(data, pos, f[6])) {
                     Some(p) => p,
                     None => break 'v,
                 };
             }
             let pid = fld(data, pos, f[5]);
-            let num = if fast { unsafe { product_num(fp(5), fl(5)) } } else { product_num_slice(pid) };
-            let cat = ctx.category(num, pid);
-            let user = hash(fld(data, pos, f[1]));
-            rec.person = user;
+            let cat = ctx.category(product_num_slice(pid), pid);
+            rec.person = hash(fld(data, pos, f[1]));
             rec.name = fbase | (pos + f[1].0 as usize) as u64;
             rec.ts = ts as u32;
             rec.pc = (price << 8) | cat;
-            linked.map.prefetch(user);
-            ring.push(rec, &mut done);
-            return;
         }
-        // invalid rows still take part in dedup; they need no person
-        out.borrow_mut().push((eid >> shift) as usize, rec);
+        out.push((eid >> shift) as usize, rec);
     });
-    ring.drain(&mut done);
 }
 
 // ---------------------------------------------------------------------------

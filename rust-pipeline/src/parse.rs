@@ -8,35 +8,47 @@ fn mum(a: u64, b: u64) -> u64 {
     (r as u64) ^ ((r >> 64) as u64)
 }
 
-/// 64-bit hash of a byte string. Short strings (the common case) use two overlapping loads
-/// and two 128-bit multiplies; long ones fall back to xxh3.
+#[inline(always)]
+fn hash_words(a: u64, c: u64, n: usize) -> u64 {
+    let x = mum(a ^ 0x2d358dccaa6c78a5, c ^ 0x8bb84b93962eacc9 ^ (n as u64));
+    mum(x ^ 0x4b33a62ed433d4a3, (n as u64) ^ 0x4d5a2da51de1aa47)
+}
+
+/// 64-bit hash of a byte string. Up to 16 bytes: the little-endian words of the first and
+/// last min(n, 8) bytes, mixed with two 128-bit multiplies; longer strings use xxh3.
 #[inline(always)]
 pub fn hash(b: &[u8]) -> u64 {
     let n = b.len();
+    if n > 16 {
+        return xxhash_rust::xxh3::xxh3_64(b) ^ 0x9e3779b97f4a7c15;
+    }
     let (a, c) = if n >= 8 {
-        if n > 16 {
-            return xxhash_rust::xxh3::xxh3_64(b) ^ 0x9e3779b97f4a7c15;
-        }
         unsafe {
             (
                 (b.as_ptr() as *const u64).read_unaligned(),
                 (b.as_ptr().add(n - 8) as *const u64).read_unaligned(),
             )
         }
-    } else if n >= 4 {
-        unsafe {
-            (
-                (b.as_ptr() as *const u32).read_unaligned() as u64,
-                (b.as_ptr().add(n - 4) as *const u32).read_unaligned() as u64,
-            )
-        }
-    } else if n > 0 {
-        (((b[0] as u64) << 16) | ((b[n >> 1] as u64) << 8) | (b[n - 1] as u64), 0)
     } else {
-        (0, 0)
+        let mut w = [0u8; 8];
+        w[..n].copy_from_slice(b);
+        let v = u64::from_le_bytes(w);
+        (v, v)
     };
-    let x = mum(a ^ 0x2d358dccaa6c78a5, c ^ 0x8bb84b93962eacc9 ^ (n as u64));
-    mum(x ^ 0x4b33a62ed433d4a3, (n as u64) ^ 0x4d5a2da51de1aa47)
+    hash_words(a, c, n)
+}
+
+/// `hash` of the n bytes at p, branch-free for 1..=16 bytes; needs 8 readable bytes on both
+/// sides of the field (the fast-path guarantee).
+#[inline(always)]
+pub unsafe fn hash_fast(p: *const u8, n: usize) -> u64 {
+    if n.wrapping_sub(1) >= 16 {
+        return hash(std::slice::from_raw_parts(p, n));
+    }
+    let sh = 64 - 8 * n.min(8) as u32;
+    let a = (p as *const u64).read_unaligned() & (!0u64 >> sh);
+    let c = (p.add(n).sub(8) as *const u64).read_unaligned() >> sh;
+    hash_words(a, c, n)
 }
 
 /// Split one line (without its '\n') into exactly N fields, returning unquoted content ranges.
@@ -627,6 +639,94 @@ pub unsafe fn digits16(end: *const u8, n: usize) -> Option<u64> {
     let hi = _mm_cvtsi128_si32(t4) as u32 as u64;
     let lo = _mm_extract_epi32(t4, 1) as u32 as u64;
     Some(hi * 100_000_000 + lo)
+}
+
+/// `YYYY-MM-DDTHH:MM:SS` at p: (valid, local epoch seconds, year outside 1900..2155).
+/// Branch-free; when the year is outside the table the caller must use `dt_swar`.
+#[inline(always)]
+unsafe fn dt_core(p: *const u8) -> (bool, i64, bool) {
+    use std::arch::x86_64::*;
+    let a = _mm_loadu_si128(p as *const __m128i);
+    let b = _mm_loadu_si128(p.add(4) as *const __m128i);
+    let pat = _mm_setr_epi8(b'-' as i8, 0, 0, b'-' as i8, 0, 0, b'T' as i8, 0, 0, b':' as i8, 0, 0, b':' as i8, 0, 0, 0);
+    let sep = (_mm_movemask_epi8(_mm_cmpeq_epi8(b, pat)) & 0x1249) == 0x1249;
+    let db = _mm_shuffle_epi8(b, _mm_setr_epi8(1, 2, 4, 5, 7, 8, 10, 11, 13, 14, -1, -1, -1, -1, -1, -1));
+    let da = _mm_shuffle_epi8(a, _mm_setr_epi8(-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 1, 2, 3, -1, -1));
+    let d = _mm_sub_epi8(_mm_or_si128(db, da), _mm_set1_epi8(b'0' as i8));
+    let dig = (_mm_movemask_epi8(_mm_cmpeq_epi8(_mm_min_epu8(d, _mm_set1_epi8(9)), d)) & 0x3FFF) == 0x3FFF;
+    let v = _mm_maddubs_epi16(d, _mm_setr_epi8(10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 0, 0));
+    let mo = _mm_extract_epi16(v, 0) as u32 & 127;
+    let dd = _mm_extract_epi16(v, 1) as u32;
+    let h = _mm_extract_epi16(v, 2) as u32;
+    let mi = _mm_extract_epi16(v, 3) as u32;
+    let s = _mm_extract_epi16(v, 4) as u32;
+    let y = _mm_extract_epi16(v, 5) as u32 * 100 + _mm_extract_epi16(v, 6) as u32;
+    let yi = y.wrapping_sub(1900);
+    let out = yi >= 256;
+    let yi = (yi & 255) as usize;
+    let (leap, mlen, mcum) = &TABLES;
+    let li = (*leap.get_unchecked(yi) as usize) * 128 + mo as usize;
+    let ml = *mlen.get_unchecked(li) as u32;
+    let ok = sep & dig & (dd.wrapping_sub(1) < ml) & (h < 24) & (mi < 60) & (s < 60);
+    let days = *YEAR_DAYS.get_unchecked(yi) as i64 + *mcum.get_unchecked(li) as i64 + dd as i64 - 1;
+    (ok, days * 86400 + (h * 3600 + mi * 60 + s) as i64, out & sep & dig)
+}
+
+/// The n (0..=16) ASCII digits ending at `end`: (all digits and n >= 1, value). Branch-free.
+#[inline(always)]
+unsafe fn digits16_bl(end: *const u8, n: usize) -> (bool, u64) {
+    use std::arch::x86_64::*;
+    let v = _mm_loadu_si128(end.sub(16) as *const __m128i);
+    let d = _mm_sub_epi8(v, _mm_set1_epi8(b'0' as i8));
+    let idx = _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+    let keep = _mm_cmpgt_epi8(idx, _mm_set1_epi8(15 - n.min(16) as i8));
+    let isdig = _mm_cmpeq_epi8(_mm_min_epu8(d, _mm_set1_epi8(9)), d);
+    let ok = _mm_movemask_epi8(_mm_andnot_si128(isdig, keep)) == 0;
+    let d = _mm_and_si128(d, keep);
+    let t1 = _mm_maddubs_epi16(d, _mm_setr_epi8(10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1));
+    let t2 = _mm_madd_epi16(t1, _mm_setr_epi16(100, 1, 100, 1, 100, 1, 100, 1));
+    let t3 = _mm_packus_epi32(t2, t2);
+    let t4 = _mm_madd_epi16(t3, _mm_setr_epi16(10000, 1, 10000, 1, 10000, 1, 10000, 1));
+    let hi = _mm_cvtsi128_si32(t4) as u32 as u64;
+    let lo = _mm_extract_epi32(t4, 1) as u32 as u64;
+    (ok & (n >= 1), hi * 100_000_000 + lo)
+}
+
+/// `parse_ts` under the fast-path read guarantee, with the F1/F2/F3 choice made without
+/// branching (formats are mixed row by row, so a branch would mispredict often).
+#[inline(always)]
+pub unsafe fn ts_fast(p: *const u8, n: usize) -> Option<i64> {
+    let is_date = (n >= 5) & (*p.add(4) == b'-');
+    let (dok, secs, out) = dt_core(p);
+    let c19 = *p.add(19);
+    let f1 = (n == 20) & (c19 == b'Z');
+    let oh = ((*p.add(20)).wrapping_sub(b'0') as u32, (*p.add(21)).wrapping_sub(b'0') as u32);
+    let om = ((*p.add(23)).wrapping_sub(b'0') as u32, (*p.add(24)).wrapping_sub(b'0') as u32);
+    let ohv = oh.0 * 10 + oh.1;
+    let omv = om.0 * 10 + om.1;
+    let f2 = (n == 25)
+        & ((c19 == b'+') | (c19 == b'-'))
+        & (*p.add(22) == b':')
+        & (oh.0 < 10)
+        & (oh.1 < 10)
+        & (om.0 < 10)
+        & (om.1 < 10)
+        & (ohv < 24)
+        & (omv < 60);
+    let off = ((ohv * 60 + omv) * 60_000) as i64;
+    let off = if c19 == b'+' { -off } else { off };
+    let date_ms = secs * 1000 + if f2 { off } else { 0 };
+    let (gok, g) = digits16_bl(p.add(n), n);
+    if (is_date & out & (f1 | f2)) | (!is_date & (n > 16)) {
+        return parse_ts(std::slice::from_raw_parts(p, n));
+    }
+    let ok = if is_date { dok & (f1 | f2) } else { gok };
+    let v = if is_date { date_ms } else { g as i64 };
+    if ok {
+        Some(v)
+    } else {
+        None
+    }
 }
 
 /// `parse_ts` for a field at p of length n, under the fast-path read guarantee.

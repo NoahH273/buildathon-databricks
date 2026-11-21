@@ -57,5 +57,81 @@ pub fn run(path: &str) {
         });
         n
     });
+    let fast = |pos: usize| pos >= 16 && pos + 128 <= len;
+    t("scan only", &|| {
+        let mut n = 0u64;
+        scan_lines::<7>(&data, 0, len, |pos, f| {
+            n = n.wrapping_add(pos as u64 ^ f[6].1 as u64);
+        });
+        n
+    });
+    t("+ ingest f1 fast", &|| {
+        let mut n = 0u64;
+        scan_lines::<7>(&data, 0, len, |pos, f| {
+            if fast(pos) {
+                n = n.wrapping_add(unsafe { parse_f1_fast(data.as_ptr().add(pos + f[3].0 as usize), (f[3].1 - f[3].0) as usize) }.unwrap_or(1) as u64);
+            }
+        });
+        n
+    });
+    t("+ ts fast", &|| {
+        let mut n = 0u64;
+        scan_lines::<7>(&data, 0, len, |pos, f| {
+            if fast(pos) {
+                n = n.wrapping_add(unsafe { parse_ts_fast(data.as_ptr().add(pos + f[2].0 as usize), (f[2].1 - f[2].0) as usize) }.unwrap_or(1) as u64);
+            }
+        });
+        n
+    });
+    t("+ product_num", &|| {
+        let mut n = 0u64;
+        scan_lines::<7>(&data, 0, len, |pos, f| {
+            if fast(pos) {
+                n = n.wrapping_add(unsafe { product_num(data.as_ptr().add(pos + f[5].0 as usize), (f[5].1 - f[5].0) as usize) }.unwrap_or(1) as u64);
+            }
+        });
+        n
+    });
+    t("+ hash eid+user", &|| {
+        let mut n = 0u64;
+        scan_lines::<7>(&data, 0, len, |pos, f| {
+            n = n.wrapping_add(hash(&data[pos + f[0].0 as usize..pos + f[0].1 as usize]));
+            n = n.wrapping_add(hash(&data[pos + f[1].0 as usize..pos + f[1].1 as usize]));
+        });
+        n
+    });
+    t("+ ts_fast (branch-free)", &|| {
+        let mut n = 0u64;
+        scan_lines::<7>(&data, 0, len, |pos, f| {
+            if fast(pos) {
+                n = n.wrapping_add(unsafe { ts_fast(data.as_ptr().add(pos + f[2].0 as usize), (f[2].1 - f[2].0) as usize) }.unwrap_or(1) as u64);
+            }
+        });
+        n
+    });
+    t("+ hash_fast eid+user", &|| {
+        let mut n = 0u64;
+        scan_lines::<7>(&data, 0, len, |pos, f| {
+            if fast(pos) {
+                n = n.wrapping_add(unsafe { hash_fast(data.as_ptr().add(pos + f[0].0 as usize), (f[0].1 - f[0].0) as usize) });
+                n = n.wrapping_add(unsafe { hash_fast(data.as_ptr().add(pos + f[1].0 as usize), (f[1].1 - f[1].0) as usize) });
+            }
+        });
+        n
+    });
+    // equivalence checks
+    let mut bad = 0;
+    scan_lines::<7>(&data, 0, len, |pos, f| {
+        if fast(pos) {
+            for k in [0usize, 1, 5] {
+                let sl = &data[pos + f[k].0 as usize..pos + f[k].1 as usize];
+                if !sl.is_empty() && unsafe { hash_fast(sl.as_ptr(), sl.len()) } != hash(sl) { bad += 1; }
+            }
+            let sl = &data[pos + f[2].0 as usize..pos + f[2].1 as usize];
+            if unsafe { ts_fast(sl.as_ptr(), sl.len()) } != parse_ts(sl) { bad += 1; }
+            if unsafe { parse_ts_fast(sl.as_ptr(), sl.len()) } != parse_ts(sl) { bad += 1; }
+        }
+    });
+    eprintln!("mismatches: {}", bad);
     black_box(&data);
 }

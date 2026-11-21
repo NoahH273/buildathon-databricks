@@ -269,7 +269,9 @@ where
         meta[p] = (total as u32, cap as u32);
         total += cap;
     }
-    let mut slots: Vec<u64> = vec![0; total];
+    let mut slots: Vec<u64> = Vec::with_capacity(total);
+    crate::advise_huge(&slots);
+    slots.resize(total, 0);
     {
         let sp = SyncPtr(slots.as_mut_ptr());
         let next = std::sync::atomic::AtomicUsize::new(0);
