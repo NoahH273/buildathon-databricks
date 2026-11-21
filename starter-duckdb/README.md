@@ -1,14 +1,16 @@
-# Shopping Sessions: DuckDB starter
+# Shopping Sessions: DuckDB baseline
 
-This repository is a working skeleton, not a complete solution. It builds a `linux/amd64` image with DuckDB, runs inside the scorer's container limits, reads the inputs, and writes both output tables with the right schema. Both tables are empty, so the checker marks this skeleton incorrect until you implement the rules in `rules.md`.
+This baseline implements `rules.md` and writes `user_daily` and `campaign_daily` as Parquet. It builds a `linux/amd64` image with DuckDB and runs inside the scorer's container limits.
 
 If this starter and `rules.md` ever disagree, `rules.md` wins. Ask the organizers if `rules.md` leaves you unsure.
 
-## What to do first
+## Implementation
 
-- Read `rules.md` for the full rules.
-- Write your pipeline in `pipeline/pipeline.py`. The TODO lists the steps in order.
-- Build the image and test against all 36 edge-case fixtures and the 1M-event dev set before submitting.
+`pipeline/pipeline.py` streams every input part through a strict binary CSV validator, preserving spaces, quoted empty values, and carriage returns. Valid rows are staged under `SCRATCH_DIR`; reversible escaping prevents DuckDB's CSV reader from treating carriage returns as line endings. Linked IDs are resolved with union by size and path compression, tracking each component's byte-wise smallest ID separately.
+
+`pipeline/pipeline.sql` handles deduplication before validation, strict timestamps, late events, sessions, categories, and both daily aggregates. Last-click credit uses an ASOF join after resolving timestamp ties. Assists use merged seven-day intervals per person and campaign to avoid expanding repeated clicks into duplicate session assists. Temporary files are removed when the run finishes.
+
+Build the image and test against all 36 edge-case fixtures and the 1M-event dev set before submitting. Local dev timings are not scorer timings.
 
 ## Run and test locally
 
@@ -39,7 +41,12 @@ To iterate without Docker:
 ```sh
 pip install duckdb==1.5.6
 python3 scripts/run_fixtures.py fixtures -- python3 pipeline/pipeline.py
+python3 -m unittest discover -s tests -v
 ```
+
+The additional regression tests cover typed empty outputs, carriage returns and literal percent escapes in IDs, an 800-link chain with an unused smallest ID, overlapping assist intervals, and inclusive seven-day boundaries. The fixture checker also needs `polars`; the pipeline and additional tests need only DuckDB.
+
+For repeated performance measurements, retained artifacts, and optional stage profiling, use the language-independent [testing harness](../testing/README.md). From the repository root, `make benchmark-duckdb DEV=/path/to/dev` runs the fixtures and benchmarks against the published `dev-answer/`. Checkpoints are enabled only in separate profiling runs; the measured baseline keeps its single SQL execution path.
 
 ## Submitting and scoring
 
@@ -77,7 +84,9 @@ Scorers are Google Cloud n2 Intel Xeon machines, Cascade Lake or newer, with AVX
 
 ## Files in this starter
 
-- `pipeline/pipeline.py` holds your pipeline code.
+- `pipeline/pipeline.py` parses inputs, resolves linked IDs, and runs the pipeline.
+- `pipeline/pipeline.sql` implements the DuckDB transformations.
+- `tests/` contains additional end-to-end regressions.
 - `Dockerfile` builds a `linux/amd64` image for the Intel Xeon scorers.
 - `fixtures/` holds the 36 edge cases, each an `input/` folder and the `expected/` tables. In this monorepo they live in `../../fixtures`; copy them in when publishing the starter as its own repo.
 - `scripts/` runs your image the way the scorer does and diffs the output.
