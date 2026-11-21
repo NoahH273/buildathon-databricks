@@ -37,13 +37,6 @@ impl<T: Copy, const B: usize> Scatter<T, B> {
         }
     }
 
-    #[inline(always)]
-    pub fn push_idx(&mut self, p: usize, x: T) -> usize {
-        let idx = unsafe { self.out.get_unchecked(p).len() + *self.fill.get_unchecked(p) as usize };
-        self.push(p, x);
-        idx
-    }
-
     pub fn finish(mut self) -> Vec<Vec<T>> {
         for p in 0..self.fill.len() {
             let f = self.fill[p] as usize;
