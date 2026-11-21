@@ -5,15 +5,17 @@ AVX2 field splitting, and a hand-written Parquet writer.
 
 ## Data flow
 
-1. **Phase 0, links.** Parse `links/` in parallel, then run a partitioned union-find. Each ID hash maps
-   to a component, and each component is named by its byte-wise smallest ID.
-2. **Phase 1, parse.** Read events and clicks in 4 MB chunks across all threads. Each user ID is
-   resolved to its person on the spot, using a prefetched lookup ring that hides the table's DRAM
-   latency. Events are scattered by `event_id` hash, keeping invalid rows, since dedup comes before
-   validation. Clicks are scattered by person.
-3. **Phase 2, dedup.** Per event_id partition, keep the copy with the smallest `ingest_ts`, drop it if
-   invalid, and scatter the survivors by person.
-4. **Phase 3, sessions.** Per person partition:
+1. **Links.** Parse `links/` and run a partitioned union-find on a side thread while phase 1 runs.
+   Each ID hash maps to a component, named by its byte-wise smallest ID.
+2. **Phase 1, parse.** Read events and clicks in 4 MB chunks across all threads. Every event row
+   emits a 20-byte dedup key `(event_id, ingest, loc)` by event_id hash, invalid rows included,
+   since dedup comes before validation. Valid events and clicks go out by user-hash partition.
+3. **Phase 2a, dedup.** Per event_id partition, keep the copy with the smallest `ingest_ts`, and
+   send every other copy's `loc` to its user partition as a kill.
+4. **Phase 2b, resolve.** Per user partition, drop killed rows and resolve each user to its person.
+   User partitions use the same top hash bits as the link table, so lookups stay in cache.
+   Unlinked users are already in the right person partition; only linked ones get scattered.
+5. **Phase 3, sessions.** Per person partition:
    - Run a counting sort on the person bits, then sort small buckets by `ts`.
    - Build sessions and per-day rows.
    - Credit each session to the last click within 7 days, breaking ties on the smallest `click_id`.
