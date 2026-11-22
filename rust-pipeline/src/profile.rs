@@ -12,41 +12,29 @@ pub enum Step {
     RequiredIds,
     IngestTimestamp,
     DedupLookup,
-    WinnerAllocationCopy,
     IndexInsertReplace,
-    EventBufferAllocation,
-    WinnerTableIteration,
-    WinnerCsvReparse,
     EventTimestampWindow,
     TypePurchasePrice,
     Lateness,
     IdentityResolution,
     ProductCategoryLookup,
     CompactEventPush,
-    RawWinnerRelease,
-    WinnerTableRelease,
 }
 #[cfg(feature = "profiling")]
-const NAMES: [&str; 19] = [
+const NAMES: [&str; 13] = [
     "file_discovery_open_header",
     "buffered_line_read",
     "csv_structure_utf8",
     "required_id_checks",
     "ingest_timestamp_parse",
     "dedup_hash_lookup_compare",
-    "winner_allocation_copy",
     "index_insert_replace_growth",
-    "event_buffer_allocation",
-    "winner_table_iteration",
-    "winner_csv_reparse",
     "event_timestamp_window",
     "event_type_purchase_price",
     "lateness_check",
     "identity_resolution",
     "product_category_lookup",
-    "compact_event_push",
-    "raw_winner_release",
-    "winner_table_release",
+    "collect_winners",
 ];
 #[derive(Default)]
 pub struct Breakdown {

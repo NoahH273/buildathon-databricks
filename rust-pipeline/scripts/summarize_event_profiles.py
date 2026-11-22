@@ -9,16 +9,18 @@ from pathlib import Path
 import statistics
 import sys
 
-PHASES = ("events_parse_dedup", "events_validate_resolve")
-
-
 def summarize(path):
     payload = json.loads(path.read_text())
     print(f"# Detailed event timings: {payload['metadata']['name']}\n")
     print(f"Source: `{path}`\n")
     profiles = [r for r in payload["runs"] if r["kind"] == "profile" and r["status"] == "passed"]
     for dataset in sorted({r["dataset"] for r in profiles}):
-        for phase in PHASES:
+        phases = dict.fromkeys(stage["name"] for run in profiles if run["dataset"] == dataset
+                               for stage in run["checkpoints"]["stages"]
+                               if stage["metrics"].get("detailed_event_profile"))
+        if not phases:
+            raise ValueError(f"{dataset}: no detailed profile metrics")
+        for phase in phases:
             details = [stage["metrics"] for run in profiles if run["dataset"] == dataset
                        for stage in run["checkpoints"]["stages"] if stage["name"] == phase
                        and stage["metrics"].get("detailed_event_profile")]

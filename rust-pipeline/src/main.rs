@@ -75,23 +75,29 @@ fn run() -> Result<()> {
         })?;
     }
     timer.mark("links_parse_intern_union")?;
+    let catalog = events::Catalog {
+        products: &products,
+        unknown,
+        start,
+        end,
+    };
     let mut detail = profile::Breakdown::default();
     let dedup = if detailed_events {
-        events::Dedup::read::<true>(&data, &mut detail)?
+        events::Dedup::read::<true>(&data, &mut people, &catalog, &mut detail)?
     } else {
-        events::Dedup::read::<false>(&data, &mut detail)?
-    };
-    timer.mark_detailed("events_parse_dedup", detailed_events.then_some(&detail))?;
-    let mut detail = profile::Breakdown::default();
-    let mut events = if detailed_events {
-        dedup.validate::<true>(&mut people, &products, unknown, start, end, &mut detail)
-    } else {
-        dedup.validate::<false>(&mut people, &products, unknown, start, end, &mut detail)
+        events::Dedup::read::<false>(&data, &mut people, &catalog, &mut detail)?
     };
     timer.mark_detailed(
-        "events_validate_resolve",
+        "events_parse_dedup_project",
         detailed_events.then_some(&detail),
     )?;
+    let mut detail = profile::Breakdown::default();
+    let mut events = if detailed_events {
+        dedup.finish::<true>(&mut detail)
+    } else {
+        dedup.finish::<false>(&mut detail)
+    };
+    timer.mark_detailed("events_collect_winners", detailed_events.then_some(&detail))?;
     sessions::sort(&mut events);
     timer.mark("events_sort")?;
     let event_count = events.len();

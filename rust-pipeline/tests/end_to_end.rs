@@ -212,10 +212,10 @@ fn detailed_checkpoints_account_for_rows_and_respect_profile_gate() {
         previous = elapsed;
     }
     for (phase, step, calls) in [
-        ("events_parse_dedup", "csv_structure_utf8", 3),
-        ("events_parse_dedup", "dedup_hash_lookup_compare", 2),
-        ("events_validate_resolve", "winner_csv_reparse", 1),
-        ("events_validate_resolve", "raw_winner_release", 1),
+        ("events_parse_dedup_project", "csv_structure_utf8", 3),
+        ("events_parse_dedup_project", "dedup_hash_lookup_compare", 2),
+        ("events_parse_dedup_project", "event_timestamp_window", 1),
+        ("events_collect_winners", "collect_winners", 1),
     ] {
         let metrics = &records.iter().find(|r| r["name"] == phase).unwrap()["metrics"];
         let subphases = metrics["subphases"].as_array().unwrap();
