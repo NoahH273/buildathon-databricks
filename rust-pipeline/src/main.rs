@@ -968,7 +968,9 @@ struct P3State<'a> {
     daygroups: Vec<(u32, u32)>, // (day idx, first session index), then an end sentinel
     sgroup: Vec<u32>,           // day group of each session
     bounds: Vec<u32>,
-    tmpcl: Vec<(u32, u32)>,     // (camp, ts)
+    win: Vec<(u64, u64)>, // open assist window per campaign, (MAX, 0) when none
+    wfrom: Vec<u32>,      // per campaign: first session index not yet passed
+    wtouched: Vec<u32>,
     counts: Vec<u32>,
     tmp_ev: Vec<Ev2>,
     tmp_cl: Vec<Cl>,
@@ -1006,7 +1008,9 @@ impl<'a> P3State<'a> {
             daygroups: Vec::new(),
             sgroup: Vec::new(),
             bounds: Vec::new(),
-            tmpcl: Vec::new(),
+            win: vec![(u64::MAX, 0); ncampx],
+            wfrom: vec![0; ncampx],
+            wtouched: Vec::new(),
             counts: Vec::new(),
             tmp_ev: Vec::new(),
             tmp_cl: Vec::new(),
@@ -1198,49 +1202,50 @@ impl<'a> P3State<'a> {
         }
         let nsess = self.sess.len() as u32;
         self.daygroups.push((u32::MAX, nsess));
-        self.tmpcl.clear();
-        self.tmpcl.extend(cl.iter().map(|c| (c.camp, c.ts)));
-        self.tmpcl.sort_unstable();
-        let mut g = 0;
-        let tl = self.tmpcl.len();
-        while g < tl {
-            let camp = self.tmpcl[g].0;
-            let mut l = self.tmpcl[g].1 as u64;
-            let mut r = l + WEEK_MS as u64;
-            let mut h = g + 1;
-            // windows of one campaign come in time order, so the search can resume
-            let mut from = 0usize;
+        // clicks arrive in ts order: grow one open window per campaign, flush it on a gap
+        for c in cl.iter() {
+            let (camp, t) = (c.camp as usize, c.ts as u64);
+            let w = self.win[camp];
+            if w.0 == u64::MAX {
+                self.wtouched.push(camp as u32);
+                self.wfrom[camp] = 0;
+            } else if t <= w.1 + 1 {
+                self.win[camp].1 = t + WEEK_MS as u64;
+                continue;
+            } else {
+                self.flush_window(camp, w.0, w.1);
+            }
+            self.win[camp] = (t, t + WEEK_MS as u64);
+        }
+        for k in 0..self.wtouched.len() {
+            let camp = self.wtouched[k] as usize;
+            let w = self.win[camp];
+            self.flush_window(camp, w.0, w.1);
+            self.win[camp] = (u64::MAX, 0);
+        }
+        self.wtouched.clear();
+    }
+
+    /// Count the sessions starting in [l, r] as assisted by `camp`, per day.
+    #[inline]
+    fn flush_window(&mut self, camp: usize, l: u64, r: u64) {
+        let from = self.wfrom[camp] as usize;
+        let a = from + self.starts[from..].partition_point(|&x| (x as u64) < l);
+        let b = a + self.starts[a..].partition_point(|&x| (x as u64) <= r);
+        self.wfrom[camp] = b as u32;
+        if a < b {
+            let nd = self.nd;
+            let mut gi = self.sgroup[a] as usize;
             loop {
-                let done = h >= tl || self.tmpcl[h].0 != camp;
-                if !done && (self.tmpcl[h].1 as u64) <= r + 1 {
-                    r = r.max(self.tmpcl[h].1 as u64 + WEEK_MS as u64);
-                    h += 1;
-                    continue;
-                }
-                let a = from + self.starts[from..].partition_point(|&x| (x as u64) < l);
-                let b = a + self.starts[a..].partition_point(|&x| (x as u64) <= r);
-                from = b;
-                if a < b {
-                    let mut gi = self.sgroup[a] as usize;
-                    loop {
-                        let (day, first) = self.daygroups[gi];
-                        let end = self.daygroups[gi + 1].1 as usize;
-                        let n = b.min(end) - a.max(first as usize);
-                        self.stats[camp as usize * nd + day as usize][3] += n as u64;
-                        if end >= b {
-                            break;
-                        }
-                        gi += 1;
-                    }
-                }
-                if done {
+                let (day, first) = self.daygroups[gi];
+                let end = self.daygroups[gi + 1].1 as usize;
+                let n = b.min(end) - a.max(first as usize);
+                self.stats[camp * nd + day as usize][3] += n as u64;
+                if end >= b {
                     break;
                 }
-                l = self.tmpcl[h].1 as u64;
-                r = l + WEEK_MS as u64;
-                h += 1;
+                gi += 1;
             }
-            g = h;
         }
     }
 
