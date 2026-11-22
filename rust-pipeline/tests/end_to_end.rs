@@ -157,6 +157,69 @@ fn dedup_cross_person_midnight_category_ties_and_invalid_utf8() {
     assert_eq!(u.column_by_name("user_id").unwrap().null_count(), 0);
 }
 
+#[test]
+fn opaque_ids_keep_their_last_byte_in_dedup_links_and_click_ties() {
+    use arrow_array::{cast::AsArray, types::Int64Type};
+    use std::collections::BTreeMap;
+
+    let w = dataset();
+    let prefix = "ab".repeat(20);
+    let a = format!("{prefix}0");
+    let b = format!("{prefix}1");
+    let time = "2028-02-28T01:00:00Z";
+    fs::write(w.0.join("links/part.csv"), format!("a,b\nz,{b}\n")).unwrap();
+    fs::write(
+        w.0.join("events/part.csv"),
+        format!(
+            "event_id,user_id,ts,ingest_ts,event_type,product_id,price_cents\n\
+             {a},{a},{time},{time},view,p1,\n\
+             {b},z,{time},{time},view,p1,\n\
+             \"{b}\",{a},{time},2028-02-28T01:01:00Z,view,p1,\n"
+        ),
+    )
+    .unwrap();
+    fs::write(
+        w.0.join("clicks/part.csv"),
+        format!("click_id,user_id,campaign_id,ts\n{b},z,c_2,{time}\n{a},{b},c_1,{time}\n"),
+    )
+    .unwrap();
+    run(&w.0);
+
+    let users = read(&w.0, "user_daily");
+    let users = &users[0];
+    let ids = users.column_by_name("user_id").unwrap().as_string::<i32>();
+    let events = users
+        .column_by_name("events")
+        .unwrap()
+        .as_primitive::<Int64Type>();
+    let counts: BTreeMap<_, _> = (0..users.num_rows())
+        .map(|i| (ids.value(i), events.value(i)))
+        .collect();
+    assert_eq!(counts, BTreeMap::from([(a.as_str(), 1), (b.as_str(), 1)]));
+
+    let campaigns = read(&w.0, "campaign_daily");
+    let campaigns = &campaigns[0];
+    let ids = campaigns
+        .column_by_name("campaign_id")
+        .unwrap()
+        .as_string::<i32>();
+    let sessions = campaigns
+        .column_by_name("sessions")
+        .unwrap()
+        .as_primitive::<Int64Type>();
+    let assists = campaigns
+        .column_by_name("assisted_sessions")
+        .unwrap()
+        .as_primitive::<Int64Type>();
+    let counts: BTreeMap<_, _> = (0..campaigns.num_rows())
+        .map(|i| (ids.value(i), (sessions.value(i), assists.value(i))))
+        .collect();
+    assert_eq!(
+        counts,
+        BTreeMap::from([("c_1", (1, 1)), ("c_2", (0, 1)), ("organic", (1, 0))])
+    );
+}
+
 #[cfg(feature = "profiling")]
 #[test]
 fn detailed_checkpoints_account_for_rows_and_respect_profile_gate() {
