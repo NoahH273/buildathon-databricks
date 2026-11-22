@@ -6,12 +6,9 @@ use crate::{
 };
 use ahash::{AHashMap, RandomState};
 use rayon::prelude::*;
-use std::{
-    collections::HashMap,
-    path::Path,
-    sync::atomic::{AtomicU64, Ordering::Relaxed},
-};
+use std::{collections::HashMap, path::Path};
 
+#[derive(Clone, Copy)]
 pub struct Event {
     pub person: Id,
     pub ts: i64,
@@ -26,54 +23,10 @@ pub struct Catalog<'a> {
     pub end: i64,
 }
 
-// Every well-formed spelling of an ID selects the same bit. Malformed rows
-// may mark extra bits, but can never hide a repeated ID.
-fn raw_id(line: &[u8]) -> &[u8] {
-    let id = &line[..memchr::memchr(b',', line).unwrap_or(line.len())];
-    id.strip_prefix(b"\"")
-        .and_then(|s| s.strip_suffix(b"\""))
-        .unwrap_or(id)
-}
-
-fn bit_position(hash: &RandomState, words: usize, id: &[u8]) -> (usize, u64) {
-    let h = hash.hash_one(id);
-    ((h as usize >> 6) & (words - 1), 1 << (h & 63))
-}
-
-fn repeated_bits(chunks: &[&[u8]], bytes: usize, hash: &RandomState) -> Vec<u64> {
-    // Size for locality from input bytes. Saturation only increases exact-map work.
-    let words = (bytes / 256).clamp(1, 1 << 23).next_power_of_two();
-    let zeros = || (0..words).map(|_| AtomicU64::new(0)).collect::<Vec<_>>();
-    let seen = zeros();
-    let repeated = zeros();
-    chunks.par_iter().for_each(|chunk| {
-        for line in csv::lines(chunk) {
-            let (word, mask) = bit_position(hash, words, raw_id(line));
-            if seen[word].load(Relaxed) & mask != 0
-                || seen[word].fetch_or(mask, Relaxed) & mask != 0
-            {
-                if repeated[word].load(Relaxed) & mask == 0 {
-                    repeated[word].fetch_or(mask, Relaxed);
-                }
-            }
-        }
-    });
-    // The parallel pass has joined. Readers need no atomics.
-    repeated.into_iter().map(AtomicU64::into_inner).collect()
-}
-
 struct Pending<'a> {
     id: &'a str,
     ingest: i64,
     event: Option<Event>,
-}
-
-#[derive(Default)]
-struct Batch<'a> {
-    events: Vec<Event>,
-    pending: Vec<Pending<'a>>,
-    singletons: Vec<&'a str>,
-    profile: Breakdown,
 }
 
 // Bind the user's exact bytes only after all row-local semantic checks pass.
@@ -124,6 +77,22 @@ fn ingest<const DETAIL: bool>(f: &[&str; 7], profile: &mut Breakdown) -> i64 {
     })
 }
 
+fn reduce<'a, const DETAIL: bool>(parts: &[Vec<Pending<'a>>]) -> (Vec<Event>, Breakdown) {
+    let mut detail = Breakdown::default();
+    let rows = parts.iter().map(Vec::len).sum();
+    let mut winners = AHashMap::with_capacity(rows);
+    for row in parts.iter().flatten() {
+        detail.measure::<DETAIL, _>(Step::DedupLookup, || {
+            let winner = winners.entry(row.id).or_insert(row);
+            if row.ingest < winner.ingest {
+                *winner = row;
+            }
+        });
+    }
+    let events = winners.into_values().filter_map(|row| row.event).collect();
+    (events, detail)
+}
+
 pub fn read<const DETAIL: bool>(
     data: &Path,
     people: &mut People,
@@ -132,130 +101,134 @@ pub fn read<const DETAIL: bool>(
 ) -> crate::Result<Vec<Event>> {
     let files = csv::load(&data.join("events"))?;
     let chunks = csv::chunks(&files);
-    let hash = RandomState::new();
-    let repeated = repeated_bits(&chunks, files.iter().map(Vec::len).sum(), &hash);
-    timer.mark("events_read_repeat_filter")?;
-
+    let workers = rayon::current_num_threads();
+    let shard_count = (workers * 8).next_power_of_two();
+    let hash = RandomState::with_seeds(0, 1, 2, 3);
     let canonical = people.canonical_ids();
-    let mut batches: Vec<_> = chunks
+    timer.mark("events_read")?;
+    let batches: Vec<_> = chunks
         .par_iter()
         .map(|chunk| {
-            let mut batch = Batch::default();
+            let mut shards: Vec<Vec<Pending>> = (0..shard_count).map(|_| Vec::new()).collect();
             let mut local = AHashMap::new();
+            let mut names = Vec::new();
+            let mut detail = Breakdown::default();
             for line in csv::lines(chunk) {
-                let Some(f) = batch
-                    .profile
-                    .measure::<DETAIL, _>(Step::CsvStructureUtf8, || csv::parse(line))
+                let Some(f) =
+                    detail.measure::<DETAIL, _>(Step::CsvStructureUtf8, || csv::parse(line))
                 else {
                     continue;
                 };
                 if f[0].is_empty() {
                     continue;
                 }
-                let ingest = ingest::<DETAIL>(&f, &mut batch.profile);
-                let event = project::<DETAIL>(&f, ingest, catalog, &mut batch.profile, |user| {
+                let ingest = ingest::<DETAIL>(&f, &mut detail);
+                let event = project::<DETAIL>(&f, ingest, catalog, &mut detail, |user| {
                     if let Some(id) = people.names.lookup(user) {
                         return canonical[id];
                     }
                     *local.entry(user).or_insert_with(|| {
-                        let id = canonical.len() + batch.singletons.len();
-                        batch.singletons.push(user);
+                        let id = canonical.len() + names.len();
+                        names.push(user);
                         id
                     })
                 });
-                let (word, mask) = bit_position(&hash, repeated.len(), f[0].as_bytes());
-                if repeated[word] & mask != 0 {
-                    batch.pending.push(Pending {
-                        id: f[0],
-                        ingest,
-                        event,
-                    });
-                } else if let Some(event) = event {
-                    batch.events.push(event);
-                }
+                let shard = hash.hash_one(f[0].as_bytes()) as usize & (shard_count - 1);
+                shards[shard].push(Pending {
+                    id: f[0],
+                    ingest,
+                    event,
+                });
             }
-            batch
+            (shards, names, detail)
         })
         .collect();
+    let mut parts: Vec<Vec<Vec<Pending>>> = (0..shard_count).map(|_| Vec::new()).collect();
     let mut detail = Breakdown::default();
-    if DETAIL {
-        for batch in &mut batches {
-            detail.merge(std::mem::take(&mut batch.profile));
-        }
-    }
-    timer.mark_detailed("events_project_candidates", DETAIL.then_some(&detail))?;
-
-    // Only this pass mutates the shared name table. Convert each chunk's new
-    // singleton names once, including names discovered in another chunk.
-    let translations: Vec<Vec<Id>> = batches
-        .iter()
-        .map(|batch| {
-            batch
-                .singletons
-                .iter()
-                .map(|name| people.person(name))
-                .collect()
+    let local_batches: Vec<_> = batches
+        .into_iter()
+        .map(|(shards, names, profile)| {
+            if DETAIL {
+                detail.merge(profile);
+            }
+            let ids: Vec<_> = names.into_iter().map(|name| people.person(name)).collect();
+            (shards, ids)
         })
         .collect();
-    batches
-        .par_iter_mut()
-        .zip(translations)
-        .for_each(|(batch, ids)| {
-            for event in batch.events.iter_mut().chain(
-                batch
-                    .pending
-                    .iter_mut()
-                    .filter_map(|row| row.event.as_mut()),
-            ) {
+    timer.mark_detailed("events_project_candidates", DETAIL.then_some(&detail))?;
+    let translated: Vec<_> = local_batches
+        .into_par_iter()
+        .map(|(mut shards, ids)| {
+            for event in shards
+                .iter_mut()
+                .flatten()
+                .filter_map(|row| row.event.as_mut())
+            {
                 if event.person >= canonical.len() {
                     event.person = ids[event.person - canonical.len()];
                 }
             }
-        });
-    let mut events = Vec::with_capacity(
-        batches
-            .iter()
-            .map(|b| b.events.len() + b.pending.len())
-            .sum(),
-    );
-    let mut winners = AHashMap::<&str, (i64, Option<Event>)>::new();
-    let mut detail = Breakdown::default();
-    for mut batch in batches {
-        events.append(&mut batch.events);
-        for row in batch.pending {
-            let winner = detail.measure::<DETAIL, _>(Step::DedupLookup, || {
-                winners.entry(row.id).or_insert((i64::MAX, None))
-            });
-            if row.ingest < winner.0 {
-                *winner = (row.ingest, row.event);
-            }
+            shards
+        })
+        .collect();
+    for shards in translated {
+        for (part, bucket) in parts.iter_mut().zip(shards) {
+            part.push(bucket);
         }
     }
-    detail.measure::<DETAIL, _>(Step::CompactEventPush, || {
-        events.extend(winners.into_values().filter_map(|(_, e)| e))
+    let mut reduced: Vec<_> = parts
+        .into_par_iter()
+        .map(|part| reduce::<DETAIL>(&part))
+        .collect();
+    let mut detail = Breakdown::default();
+    if DETAIL {
+        for (_, profile) in &mut reduced {
+            detail.merge(std::mem::take(profile));
+        }
+    }
+    let events = detail.measure::<DETAIL, _>(Step::CompactEventPush, || {
+        let mut events = Vec::with_capacity(reduced.iter().map(|(rows, _)| rows.len()).sum());
+        for (mut rows, _) in reduced {
+            events.append(&mut rows);
+        }
+        events
     });
-    timer.mark_detailed("events_resolve_repeats", DETAIL.then_some(&detail))?;
+    timer.mark_detailed("events_dedup_shards", DETAIL.then_some(&detail))?;
     Ok(events)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
-    fn repeated_filter_includes_every_spelling_and_hash_collision() {
-        let hash = RandomState::with_seeds(1, 2, 3, 4);
-        let slot = bit_position(&hash, 1, b"id");
-        let collision = (0..)
-            .map(|i| format!("other{i}"))
-            .find(|s| bit_position(&hash, 1, s.as_bytes()) == slot)
-            .unwrap();
-        let other = format!("{collision},x");
-        let chunks = [b"\"id\",a\n".as_slice(), other.as_bytes(), b"id,b\n"];
-        let bits = repeated_bits(&chunks, 0, &hash);
-        assert_eq!(bits[slot.0] & slot.1, slot.1);
-        let collisions_only = [chunks[0], chunks[1]];
-        assert_eq!(repeated_bits(&collisions_only, 0, &hash)[0], slot.1);
-        assert_eq!(raw_id(b"\" x\",\"p"), b" x");
+    fn same_shard_keeps_distinct_keys_and_an_invalid_earliest_copy() {
+        let event = Event {
+            person: 7,
+            ts: 2,
+            cents: 0,
+            category: 0,
+        };
+        let parts = [
+            vec![
+                Pending {
+                    id: "a",
+                    ingest: 3,
+                    event: Some(event),
+                },
+                Pending {
+                    id: "á",
+                    ingest: 3,
+                    event: Some(event),
+                },
+            ],
+            vec![Pending {
+                id: "a",
+                ingest: 1,
+                event: None,
+            }],
+        ];
+        let (survivors, _) = reduce::<false>(&parts);
+        assert_eq!(survivors.len(), 1);
+        assert_eq!(survivors[0].person, 7);
     }
 }
