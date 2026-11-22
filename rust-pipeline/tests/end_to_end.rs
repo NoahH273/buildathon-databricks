@@ -212,10 +212,9 @@ fn detailed_checkpoints_account_for_rows_and_respect_profile_gate() {
         previous = elapsed;
     }
     for (phase, step, calls) in [
-        ("events_parse_dedup_project", "csv_structure_utf8", 3),
-        ("events_parse_dedup_project", "dedup_hash_lookup_compare", 2),
-        ("events_parse_dedup_project", "event_timestamp_window", 1),
-        ("events_collect_winners", "collect_winners", 1),
+        ("events_resolve_repeats", "dedup_hash_lookup_compare", 2),
+        ("events_resolve_repeats", "event_timestamp_window", 1),
+        ("events_resolve_repeats", "collect_winners", 1),
     ] {
         let metrics = &records.iter().find(|r| r["name"] == phase).unwrap()["metrics"];
         let subphases = metrics["subphases"].as_array().unwrap();
@@ -231,6 +230,14 @@ fn detailed_checkpoints_account_for_rows_and_respect_profile_gate() {
         assert!(sum <= wall);
         assert!((sum + metrics["unattributed_seconds"].as_f64().unwrap() - wall).abs() < 1e-9);
     }
+    let rows: u64 = records
+        .iter()
+        .filter_map(|r| r["metrics"]["subphases"].as_array())
+        .flatten()
+        .filter(|s| s["name"] == "csv_structure_utf8")
+        .map(|s| s["calls"].as_u64().unwrap())
+        .sum();
+    assert_eq!(rows, 3);
     assert!(read(&w.0, "user_daily").is_empty());
     launch("1", "0");
     for line in fs::read_to_string(&checkpoints).unwrap().lines() {

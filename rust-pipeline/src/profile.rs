@@ -6,13 +6,10 @@ use std::time::{Duration, Instant};
 #[derive(Clone, Copy)]
 #[repr(usize)]
 pub enum Step {
-    FileSetup,
-    BufferedLineRead,
     CsvStructureUtf8,
     RequiredIds,
     IngestTimestamp,
     DedupLookup,
-    IndexInsertReplace,
     EventTimestampWindow,
     TypePurchasePrice,
     Lateness,
@@ -21,14 +18,11 @@ pub enum Step {
     CompactEventPush,
 }
 #[cfg(feature = "profiling")]
-const NAMES: [&str; 13] = [
-    "file_discovery_open_header",
-    "buffered_line_read",
+const NAMES: [&str; 10] = [
     "csv_structure_utf8",
     "required_id_checks",
     "ingest_timestamp_parse",
     "dedup_hash_lookup_compare",
-    "index_insert_replace_growth",
     "event_timestamp_window",
     "event_type_purchase_price",
     "lateness_check",
@@ -61,6 +55,13 @@ impl Breakdown {
         }
         let _ = step;
         operation()
+    }
+    pub fn merge(&mut self, _other: Self) {
+        #[cfg(feature = "profiling")]
+        for i in 0..NAMES.len() {
+            self.elapsed[i] += _other.elapsed[i];
+            self.calls[i] += _other.calls[i];
+        }
     }
     #[cfg(feature = "profiling")]
     pub fn metrics(&self, parent_seconds: f64) -> serde_json::Value {

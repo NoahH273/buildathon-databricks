@@ -6,6 +6,9 @@ pub struct Interner {
     pub values: Vec<Arc<str>>,
 }
 impl Interner {
+    pub fn lookup(&self, value: &str) -> Option<Id> {
+        self.index.get(value).copied()
+    }
     pub fn intern(&mut self, value: &str) -> Id {
         if let Some(&id) = self.index.get(value) {
             return id;
@@ -59,6 +62,14 @@ impl People {
         {
             self.minimum[a] = self.minimum[b];
         }
+    }
+    pub fn canonical_ids(&mut self) -> Vec<Id> {
+        (0..self.parent.len())
+            .map(|id| {
+                let root = self.root(id);
+                self.minimum[root]
+            })
+            .collect()
     }
     pub fn person(&mut self, value: &str) -> Id {
         let id = self.intern(value);

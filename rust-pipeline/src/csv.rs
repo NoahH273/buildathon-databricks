@@ -64,43 +64,67 @@ pub fn read<const N: usize>(
     Ok(())
 }
 
-/// Same parser and LF-only record boundaries as `read`, with exclusive I/O/parse timings.
-/// Kept separate so ordinary input scans do not execute per-row clocks or profile branches.
-pub fn read_profiled<const N: usize>(
-    path: &Path,
-    profile: &mut crate::profile::Breakdown,
-    mut accept: impl FnMut([&str; N], &[u8], &mut crate::profile::Breakdown),
-) -> io::Result<()> {
-    use crate::profile::Step;
-    let (mut reader, mut line) =
-        profile.measure::<true, _>(Step::FileSetup, || -> io::Result<_> {
-            let mut reader = BufReader::with_capacity(1 << 20, File::open(path)?);
-            let mut line = Vec::new();
-            reader.read_until(b'\n', &mut line)?;
-            Ok((reader, line))
-        })?;
-    loop {
-        let bytes = profile.measure::<true, _>(Step::BufferedLineRead, || {
-            line.clear();
-            let bytes = reader.read_until(b'\n', &mut line)?;
-            if line.last() == Some(&b'\n') {
-                line.pop();
-            }
-            Ok::<_, io::Error>(bytes)
-        })?;
-        if bytes == 0 {
-            break;
+/// Iterate LF-delimited records, including a final unterminated record.
+pub fn lines(mut data: &[u8]) -> impl Iterator<Item = &[u8]> {
+    std::iter::from_fn(move || {
+        if data.is_empty() {
+            return None;
         }
-        if let Some(fields) = profile.measure::<true, _>(Step::CsvStructureUtf8, || parse(&line)) {
-            accept(fields, &line, profile);
+        if let Some(end) = memchr::memchr(b'\n', data) {
+            let row = &data[..end];
+            data = &data[end + 1..];
+            Some(row)
+        } else {
+            Some(std::mem::take(&mut data))
+        }
+    })
+}
+
+/// Remove each file's header once and share complete rows between workers.
+pub fn chunks(files: &[Vec<u8>]) -> Vec<&[u8]> {
+    const TARGET: usize = 512 * 1024;
+    let mut chunks = Vec::new();
+    for file in files {
+        let Some(header) = memchr::memchr(b'\n', file) else {
+            continue;
+        };
+        let mut data = &file[header + 1..];
+        while !data.is_empty() {
+            let end = data
+                .get(TARGET..)
+                .and_then(|tail| memchr::memchr(b'\n', tail))
+                .map_or(data.len(), |i| TARGET + i + 1);
+            let (chunk, rest) = data.split_at(end);
+            chunks.push(chunk);
+            data = rest;
         }
     }
-    Ok(())
+    chunks
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn chunk_boundaries_preserve_long_and_unterminated_rows() {
+        let long = vec![b'x'; 512 * 1024 + 17];
+        let mut part = b"header\nfirst\n\n".to_vec();
+        part.extend_from_slice(&long);
+        part.extend_from_slice(b"\nlast\r");
+        let files = [
+            b"header".to_vec(),
+            b"header\n".to_vec(),
+            part,
+            b"h\nnext\n".to_vec(),
+        ];
+        let pieces = chunks(&files);
+        assert!(pieces.len() > 2);
+        let actual: Vec<_> = pieces.iter().flat_map(|piece| lines(piece)).collect();
+        assert_eq!(
+            actual,
+            [b"first".as_slice(), b"", &long, b"last\r", b"next"]
+        );
+    }
     #[test]
     fn exact_dialect() {
         assert_eq!(parse::<3>(b"\"\", u1,\"x\""), Some(["", " u1", "x"]));

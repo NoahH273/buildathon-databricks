@@ -34,8 +34,21 @@ fn run() -> Result<()> {
         .unwrap_or_else(|| path("OUTPUT_DIR", "/output"));
     let mut timer = timing::Timer::new()?;
     let detailed_events = timer.detailed_events();
-    // The implementation is serial and in-memory: NCPU/MEM_GB are resource ceilings,
-    // not a promise to allocate all available resources. No runtime cache/spills.
+    let available = std::thread::available_parallelism()?.get();
+    let requested = env::var("NCPU")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n > 0);
+    // Exclusive operation timers need one clock timeline. Coarse profiles and
+    // submission builds both use the regular worker count.
+    let workers = if detailed_events {
+        1
+    } else {
+        requested.unwrap_or(available).min(available)
+    };
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(workers)
+        .build_global()?;
     let manifest: serde_json::Value =
         serde_json::from_slice(&fs::read(data.join("manifest.json"))?)?;
     let start = manifest["window_start"]
@@ -81,23 +94,11 @@ fn run() -> Result<()> {
         start,
         end,
     };
-    let mut detail = profile::Breakdown::default();
-    let dedup = if detailed_events {
-        events::Dedup::read::<true>(&data, &mut people, &catalog, &mut detail)?
-    } else {
-        events::Dedup::read::<false>(&data, &mut people, &catalog, &mut detail)?
-    };
-    timer.mark_detailed(
-        "events_parse_dedup_project",
-        detailed_events.then_some(&detail),
-    )?;
-    let mut detail = profile::Breakdown::default();
     let mut events = if detailed_events {
-        dedup.finish::<true>(&mut detail)
+        events::read::<true>(&data, &mut people, &catalog, &mut timer)?
     } else {
-        dedup.finish::<false>(&mut detail)
+        events::read::<false>(&data, &mut people, &catalog, &mut timer)?
     };
-    timer.mark_detailed("events_collect_winners", detailed_events.then_some(&detail))?;
     sessions::sort(&mut events);
     timer.mark("events_sort")?;
     let event_count = events.len();
