@@ -382,7 +382,7 @@ fn main() {
     }
     let est_events = ev_bytes / 70 + 1;
     let est_clicks = cl_bytes / 45 + 1;
-    let b1 = ((est_events / 80_000).max(16).next_power_of_two().trailing_zeros()).min(12);
+    let b1 = ((est_events / 160_000).max(16).next_power_of_two().trailing_zeros()).min(12);
     let b2 = ((est_events / 40_000).max(16).next_power_of_two().trailing_zeros()).min(11);
     let p1 = 1usize << b1;
     let p2 = 1usize << b2;
