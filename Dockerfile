@@ -11,5 +11,6 @@ RUN cargo build --release --locked \
 
 FROM debian:bookworm-slim
 COPY --from=build /shopping-sessions /app/shopping-sessions
+ENV GLIBC_TUNABLES=glibc.malloc.hugetlb=1
 USER 1000:1000
 CMD ["/app/shopping-sessions"]
