@@ -664,6 +664,8 @@ fn parse_links(ctx: &Ctx, c: Chunk, out: &mut Vec<LinkRec>) {
             hb: hash(b),
             ra: fbase | (pos + f[0].0 as usize) as u64,
             rb: fbase | (pos + f[1].0 as usize) as u64,
+            pa: links::prefix8(a),
+            pb: links::prefix8(b),
         });
     });
 }

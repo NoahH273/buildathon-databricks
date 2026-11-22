@@ -13,6 +13,8 @@ pub struct LinkRec {
     pub hb: u64,
     pub ra: u64,
     pub rb: u64,
+    pub pa: u64, // prefix8 of each side, taken while the line is in cache
+    pub pb: u64,
 }
 
 /// Bits of the user hash kept in a slot; the rest of the slot holds component + 1.
@@ -108,11 +110,12 @@ pub struct Linked {
 struct Entry {
     h: u64,
     r: u64,
+    p: u64,
     slot: u32,
 }
 
 /// Big-endian first 8 bytes, zero padded: orders like the bytes up to ties.
-fn prefix8(s: &[u8]) -> u64 {
+pub fn prefix8(s: &[u8]) -> u64 {
     let mut b = [0u8; 8];
     let n = s.len().min(8);
     b[..n].copy_from_slice(&s[..n]);
@@ -145,8 +148,8 @@ where
                     let mut out: Vec<Vec<Entry>> = (0..NP).map(|_| Vec::with_capacity(v.len() * 2 / NP + 16)).collect();
                     for (j, r) in v.iter().enumerate() {
                         let g = (off + j) as u32;
-                        out[(r.ha >> (64 - LB)) as usize].push(Entry { h: r.ha, r: r.ra, slot: 2 * g });
-                        out[(r.hb >> (64 - LB)) as usize].push(Entry { h: r.hb, r: r.rb, slot: 2 * g + 1 });
+                        out[(r.ha >> (64 - LB)) as usize].push(Entry { h: r.ha, r: r.ra, p: r.pa, slot: 2 * g });
+                        out[(r.hb >> (64 - LB)) as usize].push(Entry { h: r.hb, r: r.rb, p: r.pb, slot: 2 * g + 1 });
                     }
                     out
                 })
@@ -168,7 +171,6 @@ where
             for _ in 0..nthreads {
                 let ents = &ents;
                 let next = &next;
-                let ref_str = &ref_str;
                 let res_ptr = &res_ptr;
                 s.spawn(move || loop {
                     let p = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -184,7 +186,7 @@ where
                             let id = map.insert(en.h, n);
                             if id == n {
                                 part.hashes.push(en.h);
-                                part.keys.push((prefix8(ref_str(en.r)), en.r));
+                                part.keys.push((en.p, en.r));
                             }
                             part.ent_ids.push((en.slot, id));
                         }
