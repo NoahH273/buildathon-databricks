@@ -14,27 +14,37 @@ pub fn decimal(value: &str) -> Option<i64> {
     })
 }
 
+/// The caller has checked the fixed-width timestamp layout.
+#[inline]
+fn pair(high: u8, low: u8) -> Option<i64> {
+    let a = high.wrapping_sub(b'0');
+    let b = low.wrapping_sub(b'0');
+    if a > 9 || b > 9 {
+        return None;
+    }
+    Some(i64::from(a * 10 + b))
+}
+
 // Strict Gregorian calendar validation followed by days_from_civil (Hinnant).
 pub fn parse(value: &str) -> Option<i64> {
     let b = value.as_bytes();
-    if !b.is_empty() && b.iter().all(u8::is_ascii_digit) {
+    if b.get(4) != Some(&b'-') {
         return decimal(value);
     }
-    if b.len() != 20 && b.len() != 25 {
+    if !matches!(b.len(), 20 | 25)
+        || b[7] != b'-'
+        || b[10] != b'T'
+        || b[13] != b':'
+        || b[16] != b':'
+    {
         return None;
     }
-    for (at, expected) in [(4, b'-'), (7, b'-'), (10, b'T'), (13, b':'), (16, b':')] {
-        if b[at] != expected {
-            return None;
-        }
-    }
-    let number = |start, end| decimal(std::str::from_utf8(&b[start..end]).ok()?);
-    let year = number(0, 4)?;
-    let month = number(5, 7)?;
-    let day = number(8, 10)?;
-    let hour = number(11, 13)?;
-    let minute = number(14, 16)?;
-    let second = number(17, 19)?;
+    let year = 100 * pair(b[0], b[1])? + pair(b[2], b[3])?;
+    let month = pair(b[5], b[6])?;
+    let day = pair(b[8], b[9])?;
+    let hour = pair(b[11], b[12])?;
+    let minute = pair(b[14], b[15])?;
+    let second = pair(b[17], b[18])?;
     let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
     let max_day = match month {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
@@ -60,8 +70,8 @@ pub fn parse(value: &str) -> Option<i64> {
         if !matches!(b[19], b'+' | b'-') || b[22] != b':' {
             return None;
         }
-        let h = number(20, 22)?;
-        let m = number(23, 25)?;
+        let h = pair(b[20], b[21])?;
+        let m = pair(b[23], b[24])?;
         if h > 23 || m > 59 {
             return None;
         }
@@ -83,6 +93,24 @@ pub fn in_window(value: &str, start: i64, end: i64) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn every_iso_digit_position_requires_ascii_digits() {
+        let base = "2000-02-29T23:59:58-23:59";
+        assert!(parse(base).is_some());
+        for (i, b) in base.bytes().enumerate().filter(|(_, b)| b.is_ascii_digit()) {
+            for invalid in [b'/', b':', b' ', b'a', 0] {
+                let mut changed = base.as_bytes().to_vec();
+                changed[i] = invalid;
+                assert!(
+                    parse(std::str::from_utf8(&changed).unwrap()).is_none(),
+                    "position {i} was {b}"
+                );
+            }
+        }
+        for len in [20, 25, 100] {
+            assert_eq!(parse(&format!("{:0len$}", 86400000)), Some(DAY));
+        }
+    }
     #[test]
     fn strict_forms() {
         assert_eq!(parse("1970-01-01T00:00:00Z"), Some(0));
