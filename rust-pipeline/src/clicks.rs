@@ -5,52 +5,53 @@ use crate::{
     sessions::Session,
     timestamp::{self, WEEK},
 };
-use std::{
-    collections::{HashMap, HashSet},
-    io,
-    path::Path,
-};
-pub struct Click {
+use rayon::prelude::*;
+use std::collections::HashMap;
+
+pub struct Click<'a> {
     pub person: Id,
     pub ts: i64,
-    pub id: Box<str>,
+    pub id: &'a str,
     pub campaign: Id,
 }
-pub fn read(
-    data: &Path,
+
+pub fn read<'a>(
+    files: &'a [Vec<u8>],
     people: &mut People,
     campaigns: &HashMap<Box<str>, Id>,
     start: i64,
     end: i64,
-) -> io::Result<Vec<Click>> {
-    let mut seen: HashSet<Box<str>> = HashSet::new();
-    let mut clicks = Vec::new();
-    for path in csv::files(&data.join("clicks"))? {
-        csv::read::<4>(&path, |f, _| {
-            if f[0].is_empty() || !seen.insert(f[0].into()) {
-                return;
-            }
-            if f[1].is_empty() {
-                return;
-            }
-            let Some(&campaign) = campaigns.get(f[2]) else {
-                return;
-            };
-            let Some(ts) = timestamp::in_window(f[3], start - WEEK, end) else {
-                return;
-            };
-            clicks.push(Click {
-                person: people.person(f[1]),
-                ts,
-                id: f[0].into(),
-                campaign,
-            });
-        })?;
-    }
-    Ok(clicks)
+) -> Vec<Click<'a>> {
+    let canonical = people.canonical_ids();
+    csv::chunks(files)
+        .into_par_iter()
+        .flat_map_iter(|chunk| {
+            csv::lines(chunk).filter_map(|line| {
+                let [id, user, campaign, time] = csv::parse(line)?;
+                if id.is_empty() || user.is_empty() {
+                    return None;
+                }
+                // Every alias of a session owner is already present from links or
+                // surviving events. A click-only singleton cannot affect a session.
+                let person = canonical[people.names.lookup(user)?];
+                let campaign = *campaigns.get(campaign)?;
+                let ts = timestamp::in_window(time, start - WEEK, end)?;
+                Some(Click {
+                    person,
+                    ts,
+                    id,
+                    campaign,
+                })
+            })
+        })
+        .collect()
 }
-pub fn sort(clicks: &mut [Click]) {
-    clicks.sort_unstable_by(|a, b| (a.person, a.ts, &a.id).cmp(&(b.person, b.ts, &b.id)));
+
+pub fn sort(clicks: &mut Vec<Click<'_>>) {
+    clicks.par_sort_unstable_by(|a, b| (a.person, a.ts, a.id).cmp(&(b.person, b.ts, b.id)));
+    // All copies of a click have identical decoded fields. Validation and
+    // resolution therefore agree, and the common sort makes copies adjacent.
+    clicks.dedup_by(|a, b| a.id == b.id);
 }
 
 /// Each person's window is [left,right), with one dense active-campaign set.
@@ -132,15 +133,17 @@ pub fn attribute(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
     #[test]
     fn sweep_matches_brute_force_with_expiry_ties_and_swap_removal() {
         let mut clicks = Vec::new();
         // Deliberate repeated times, several persons, gaps, repeated campaigns, and byte ID ties.
-        for i in 0..500 {
+        let ids: Vec<_> = (0..500).map(|i| format!("k{}", 500 - i)).collect();
+        for (i, id) in ids.iter().enumerate() {
             clicks.push(Click {
                 person: i % 4,
                 ts: (i as i64 / 4) * 10000000,
-                id: format!("k{}", 500 - i).into(),
+                id,
                 campaign: i % 7,
             });
         }
@@ -164,7 +167,7 @@ mod tests {
                 .collect();
             let winner = eligible
                 .iter()
-                .min_by(|a, b| b.ts.cmp(&a.ts).then_with(|| a.id.cmp(&b.id)))
+                .min_by(|a, b| b.ts.cmp(&a.ts).then_with(|| a.id.cmp(b.id)))
                 .map_or(7, |c| c.campaign);
             let row = expected.entry((winner, s.day)).or_default();
             row.sessions += 1;

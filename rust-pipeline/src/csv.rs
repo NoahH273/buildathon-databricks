@@ -30,6 +30,11 @@ pub fn parse<const N: usize>(line: &[u8]) -> Option<[&str; N]> {
     (count == N).then_some(fields)
 }
 
+pub fn load(directory: &Path) -> io::Result<Vec<Vec<u8>>> {
+    use rayon::prelude::*;
+    files(directory)?.par_iter().map(fs::read).collect()
+}
+
 pub fn files(directory: &Path) -> io::Result<Vec<PathBuf>> {
     let mut paths = Vec::new();
     for entry in fs::read_dir(directory)? {

@@ -8,7 +8,6 @@ use ahash::{AHashMap, RandomState};
 use rayon::prelude::*;
 use std::{
     collections::HashMap,
-    fs, io,
     path::Path,
     sync::atomic::{AtomicU64, Ordering::Relaxed},
 };
@@ -125,11 +124,7 @@ pub fn read<const DETAIL: bool>(
     catalog: &Catalog<'_>,
     timer: &mut crate::timing::Timer,
 ) -> crate::Result<Vec<Event>> {
-    let paths = csv::files(&data.join("events"))?;
-    let files = paths
-        .par_iter()
-        .map(fs::read)
-        .collect::<io::Result<Vec<_>>>()?;
+    let files = csv::load(&data.join("events"))?;
     let chunks = csv::chunks(&files);
     let hash = RandomState::new();
     let repeated = repeated_bits(&chunks, files.iter().map(Vec::len).sum(), &hash);

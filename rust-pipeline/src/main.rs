@@ -104,10 +104,11 @@ fn run() -> Result<()> {
     let event_count = events.len();
     let (sessions, users) = sessions::build(events, &categories);
     timer.mark("sessions_user_aggregation")?;
-    let mut clicks = clicks::read(&data, &mut people, &campaign_lookup, start, end)?;
-    timer.mark("clicks_parse_dedup_validate")?;
+    let click_files = csv::load(&data.join("clicks"))?;
+    let mut clicks = clicks::read(&click_files, &mut people, &campaign_lookup, start, end);
+    timer.mark("clicks_read_validate")?;
     clicks::sort(&mut clicks);
-    timer.mark("clicks_sort")?;
+    timer.mark("clicks_sort_dedup")?;
     let campaigns = clicks::attribute(&sessions, &clicks, channels.len(), organic);
     timer.mark("attribution_campaign_aggregation")?;
     // Necessary conservation checks; exact correctness is checked by the independent harness.
@@ -133,6 +134,7 @@ fn run() -> Result<()> {
     let user_rows = users.len();
     let campaign_rows = campaigns.len();
     drop(clicks);
+    drop(click_files);
     drop(products);
     parquet::users(&out, users, &people.names, &categories)?;
     parquet::campaigns(&out, campaigns, &campaign_names, &channels)?;
