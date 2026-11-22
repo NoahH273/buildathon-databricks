@@ -854,9 +854,10 @@ fn parse_events(ctx: &Ctx, c: Chunk, out: &mut Scatter<Ev1, B1>) {
 // ---------------------------------------------------------------------------
 // Phase 3
 
-/// Gather `srcs` into `v` sorted by (person, ts): LSD radix on ts (three 11-bit digits), then a
-/// stable pass on the person bits below the partition bits. People that share a bucket are then
-/// separated by a stable sort on person, which keeps their ts order.
+/// Gather `srcs` into `v` sorted by (person, ts): LSD radix on ts bits 11..33 (two 11-bit
+/// digits), then a stable pass on the person bits below the partition bits. People sharing a
+/// bucket are separated by a stable sort on person, and a last insertion pass orders the rare
+/// same-person events that fall in one 2 s step.
 fn radix_sort<T: Copy>(
     srcs: &[&[T]],
     v: &mut Vec<T>,
@@ -881,22 +882,20 @@ fn radix_sort<T: Copy>(
     let bucket = |x: &T| ((person(x) >> shift) as usize) & (k - 1);
     const D: usize = 2048;
     hist.clear();
-    hist.resize(3 * D + k, 0);
-    let (h0, rest) = hist.split_at_mut(D);
-    let (h1, rest) = rest.split_at_mut(D);
+    hist.resize(2 * D + k, 0);
+    let (h1, rest) = hist.split_at_mut(D);
     let (h2, hb) = rest.split_at_mut(D);
     for s in srcs {
         for x in s.iter() {
             let t = ts(x) as usize;
             unsafe {
-                *h0.get_unchecked_mut(t & (D - 1)) += 1;
                 *h1.get_unchecked_mut((t >> 11) & (D - 1)) += 1;
                 *h2.get_unchecked_mut((t >> 22) & (D - 1)) += 1;
                 *hb.get_unchecked_mut(bucket(x)) += 1;
             }
         }
     }
-    for h in [&mut *h0, &mut *h1, &mut *h2, &mut *hb] {
+    for h in [&mut *h1, &mut *h2, &mut *hb] {
         let mut acc = 0u32;
         for c in h.iter_mut() {
             let t = *c;
@@ -912,16 +911,10 @@ fn radix_sort<T: Copy>(
         let (vp, tp) = (v.as_mut_ptr(), tmp.as_mut_ptr());
         for s in srcs {
             for x in s.iter() {
-                let p = h0.get_unchecked_mut(ts(x) as usize & (D - 1));
-                *tp.add(*p as usize) = *x;
+                let p = h1.get_unchecked_mut((ts(x) as usize >> 11) & (D - 1));
+                *vp.add(*p as usize) = *x;
                 *p += 1;
             }
-        }
-        for i in 0..n {
-            let x = &*tp.add(i);
-            let p = h1.get_unchecked_mut((ts(x) as usize >> 11) & (D - 1));
-            *vp.add(*p as usize) = *x;
-            *p += 1;
         }
         for i in 0..n {
             let x = &*vp.add(i);
@@ -948,6 +941,18 @@ fn radix_sort<T: Copy>(
             }
         }
         start = end;
+    }
+    for i in 1..n {
+        if ts(&v[i]) < ts(&v[i - 1]) && person(&v[i]) == person(&v[i - 1]) {
+            let x = v[i];
+            let (px, tx) = (person(&x), ts(&x));
+            let mut j = i;
+            while j > 0 && person(&v[j - 1]) == px && ts(&v[j - 1]) > tx {
+                v[j] = v[j - 1];
+                j -= 1;
+            }
+            v[j] = x;
+        }
     }
 }
 
@@ -1039,19 +1044,6 @@ impl<'a> P3State<'a> {
     ) {
         radix_sort(ev_srcs, evs, &mut self.tmp_ev, &mut self.counts, ctx.b2, |e| e.person, |e| e.ts);
         radix_sort(cl_srcs, cls, &mut self.tmp_cl, &mut self.counts, ctx.b2, |c| c.person, |c| c.ts);
-        // clicks at the same (person, ts) are ordered by click_id
-        let mut i = 0;
-        while i + 1 < cls.len() {
-            let (p, t) = (cls[i].person, cls[i].ts);
-            let mut j = i + 1;
-            while j < cls.len() && cls[j].person == p && cls[j].ts == t {
-                j += 1;
-            }
-            if j - i > 1 {
-                cls[i..j].sort_by(|a, b| ctx.ref_str(a.cid).cmp(ctx.ref_str(b.cid)));
-            }
-            i = j;
-        }
         let n = evs.len();
         // person boundaries, so that name lookups can be prefetched a few people ahead
         self.bounds.clear();
@@ -1091,7 +1083,7 @@ impl<'a> P3State<'a> {
         }
     }
 
-    fn flush_day(&mut self, ctx: &Ctx, name: u64, day: u32, s: i64, e: i64, r: i64) {
+    fn flush_day(&mut self, name: &[u8], day: u32, s: i64, e: i64, r: i64) {
         let mut best: i32 = -1;
         let mut bestv = 0u64;
         for &c in &self.touched {
@@ -1103,7 +1095,7 @@ impl<'a> P3State<'a> {
             self.catsum[c as usize] = 0;
         }
         self.touched.clear();
-        parquet::put_plain_str(&mut self.names, ctx.ref_str(name));
+        parquet::put_plain_str(&mut self.names, name);
         self.days.push((self.ws_day + day as i64) as i32);
         self.sessions.push(s);
         self.events.push(e);
@@ -1122,7 +1114,7 @@ impl<'a> P3State<'a> {
     }
 
     fn process_person(&mut self, ctx: &Ctx, ev: &[Ev2], cl: &[Cl]) {
-        let name = self.name_ref(ev[0].name);
+        let name = ctx.ref_str(self.name_ref(ev[0].name));
         self.sess.clear();
         let mut k = 0;
         let n = ev.len();
@@ -1133,7 +1125,7 @@ impl<'a> P3State<'a> {
             let day = ((self.base + start as i64).div_euclid(DAY_MS) - self.ws_day) as u32;
             if day != cur_day {
                 if cur_day != u32::MAX {
-                    self.flush_day(ctx, name, cur_day, ds, de, dr);
+                    self.flush_day(name, cur_day, ds, de, dr);
                 }
                 cur_day = day;
                 ds = 0;
@@ -1167,23 +1159,33 @@ impl<'a> P3State<'a> {
             self.sess.push(Sess { start, day, rev, purch: rev > 0 });
             k = m;
         }
-        self.flush_day(ctx, name, cur_day, ds, de, dr);
+        self.flush_day(name, cur_day, ds, de, dr);
 
         // credit
         let nd = self.nd;
         let mut hi = 0;
+        let (mut last_hi, mut last_camp) = (0usize, 0u32);
         for s in self.sess.iter() {
             while hi < cl.len() && cl[hi].ts <= s.start {
                 hi += 1;
             }
             let mut camp = self.organic;
             if hi > 0 && (s.start - cl[hi - 1].ts) as i64 <= WEEK_MS {
-                let t = cl[hi - 1].ts;
-                let mut kk = hi - 1;
-                while kk > 0 && cl[kk - 1].ts == t {
-                    kk -= 1;
+                if hi != last_hi {
+                    // latest click; same-ms ties go to the smallest click_id
+                    let t = cl[hi - 1].ts;
+                    let mut best = hi - 1;
+                    let mut kk = hi - 1;
+                    while kk > 0 && cl[kk - 1].ts == t {
+                        kk -= 1;
+                        if ctx.ref_str(cl[kk].cid) < ctx.ref_str(cl[best].cid) {
+                            best = kk;
+                        }
+                    }
+                    last_hi = hi;
+                    last_camp = cl[best].camp;
                 }
-                camp = cl[kk].camp;
+                camp = last_camp;
             }
             let x = &mut self.stats[camp as usize * nd + s.day as usize];
             x[0] += 1;
