@@ -1,6 +1,6 @@
 use crate::{
     csv,
-    ids::{Id, People},
+    ids::{Id, PersonIds},
     profile::{Breakdown, Step},
     timestamp,
 };
@@ -49,12 +49,10 @@ fn repeated_bits(chunks: &[&[u8]], bytes: usize, hash: &RandomState) -> Vec<u64>
     chunks.par_iter().for_each(|chunk| {
         for line in csv::lines(chunk) {
             let (word, mask) = bit_position(hash, words, raw_id(line));
-            if seen[word].load(Relaxed) & mask != 0
-                || seen[word].fetch_or(mask, Relaxed) & mask != 0
-            {
-                if repeated[word].load(Relaxed) & mask == 0 {
-                    repeated[word].fetch_or(mask, Relaxed);
-                }
+            let seen_before = seen[word].load(Relaxed) & mask != 0
+                || seen[word].fetch_or(mask, Relaxed) & mask != 0;
+            if seen_before && repeated[word].load(Relaxed) & mask == 0 {
+                repeated[word].fetch_or(mask, Relaxed);
             }
         }
     });
@@ -126,17 +124,19 @@ fn ingest<const DETAIL: bool>(f: &[&str; 7], profile: &mut Breakdown) -> i64 {
 
 pub fn read<const DETAIL: bool>(
     data: &Path,
-    people: &mut People,
+    people: &mut PersonIds,
     catalog: &Catalog<'_>,
     timer: &mut crate::timing::Timer,
 ) -> crate::Result<Vec<Event>> {
     let files = csv::load(&data.join("events"))?;
     let chunks = csv::chunks(&files);
-    let hash = RandomState::new();
+    // A fixed routing hash also keeps singleton handle assignment (and thus
+    // Parquet row order) repeatable. The exact fallback compares full keys.
+    let hash = RandomState::with_seeds(0, 1, 2, 3);
     let repeated = repeated_bits(&chunks, files.iter().map(Vec::len).sum(), &hash);
     timer.mark("events_read_repeat_filter")?;
 
-    let canonical = people.canonical_ids();
+    let existing_names = people.names().values.len();
     let mut batches: Vec<_> = chunks
         .par_iter()
         .map(|chunk| {
@@ -154,11 +154,11 @@ pub fn read<const DETAIL: bool>(
                 }
                 let ingest = ingest::<DETAIL>(&f, &mut batch.profile);
                 let event = project::<DETAIL>(&f, ingest, catalog, &mut batch.profile, |user| {
-                    if let Some(id) = people.names.lookup(user) {
-                        return canonical[id];
+                    if let Some(id) = people.lookup(user) {
+                        return id;
                     }
                     *local.entry(user).or_insert_with(|| {
-                        let id = canonical.len() + batch.singletons.len();
+                        let id = existing_names + batch.singletons.len();
                         batch.singletons.push(user);
                         id
                     })
@@ -207,8 +207,8 @@ pub fn read<const DETAIL: bool>(
                     .iter_mut()
                     .filter_map(|row| row.event.as_mut()),
             ) {
-                if event.person >= canonical.len() {
-                    event.person = ids[event.person - canonical.len()];
+                if event.person >= existing_names {
+                    event.person = ids[event.person - existing_names];
                 }
             }
         });

@@ -1,8 +1,9 @@
-use std::{collections::HashMap, sync::Arc};
+use ahash::AHashMap;
+use std::sync::Arc;
 pub type Id = usize;
 #[derive(Default)]
 pub struct Interner {
-    index: HashMap<Arc<str>, Id>,
+    index: AHashMap<Arc<str>, Id>,
     pub values: Vec<Arc<str>>,
 }
 impl Interner {
@@ -63,20 +64,41 @@ impl People {
             self.minimum[a] = self.minimum[b];
         }
     }
-    pub fn canonical_ids(&mut self) -> Vec<Id> {
-        (0..self.parent.len())
+    /// Consume the link forest and rewrite each exact alias lookup to its
+    /// final byte-minimum ID. New event-only names are singleton components.
+    pub fn resolve(mut self) -> PersonIds {
+        let canonical: Vec<_> = (0..self.parent.len())
             .map(|id| {
                 let root = self.root(id);
                 self.minimum[root]
             })
-            .collect()
+            .collect();
+        for id in self.names.index.values_mut() {
+            *id = canonical[*id];
+        }
+        PersonIds(self.names)
     }
+    #[cfg(test)]
     pub fn person(&mut self, value: &str) -> Id {
         let id = self.intern(value);
         let root = self.root(id);
         self.minimum[root]
     }
 }
+/// The table includes every linked spelling; multiple names may return one ID.
+pub struct PersonIds(Interner);
+impl PersonIds {
+    pub fn lookup(&self, name: &str) -> Option<Id> {
+        self.0.lookup(name)
+    }
+    pub fn person(&mut self, name: &str) -> Id {
+        self.0.intern(name)
+    }
+    pub fn names(&self) -> &Interner {
+        &self.0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -100,5 +122,10 @@ mod tests {
             p.union(&format!("shared{i}"), "device");
         }
         assert_eq!(p.person("shared999"), p.person("device"));
+        let mut resolved = p.resolve();
+        assert_eq!(resolved.lookup("u1"), resolved.lookup("A_unused"));
+        let singleton = resolved.person("new singleton");
+        assert_eq!(resolved.lookup("new singleton"), Some(singleton));
+        assert_eq!(&*resolved.names().values[singleton], "new singleton");
     }
 }

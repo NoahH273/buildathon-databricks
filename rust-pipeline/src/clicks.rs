@@ -1,7 +1,7 @@
 use crate::{
     aggregate::Campaigns,
     csv,
-    ids::{Id, People},
+    ids::{Id, PersonIds},
     sessions::Session,
     timestamp::{self, WEEK},
 };
@@ -17,12 +17,11 @@ pub struct Click<'a> {
 
 pub fn read<'a>(
     files: &'a [Vec<u8>],
-    people: &mut People,
+    people: &PersonIds,
     campaigns: &HashMap<Box<str>, Id>,
     start: i64,
     end: i64,
 ) -> Vec<Click<'a>> {
-    let canonical = people.canonical_ids();
     csv::chunks(files)
         .into_par_iter()
         .flat_map_iter(|chunk| {
@@ -33,7 +32,7 @@ pub fn read<'a>(
                 }
                 // Every alias of a session owner is already present from links or
                 // surviving events. A click-only singleton cannot affect a session.
-                let person = canonical[people.names.lookup(user)?];
+                let person = people.lookup(user)?;
                 let campaign = *campaigns.get(campaign)?;
                 let ts = timestamp::in_window(time, start - WEEK, end)?;
                 Some(Click {

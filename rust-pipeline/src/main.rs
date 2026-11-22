@@ -87,6 +87,7 @@ fn run() -> Result<()> {
             }
         })?;
     }
+    let mut people = people.resolve();
     timer.mark("links_parse_intern_union")?;
     let catalog = events::Catalog {
         products: &products,
@@ -105,7 +106,7 @@ fn run() -> Result<()> {
     let (sessions, users) = sessions::build(events, &categories);
     timer.mark("sessions_user_aggregation")?;
     let click_files = csv::load(&data.join("clicks"))?;
-    let mut clicks = clicks::read(&click_files, &mut people, &campaign_lookup, start, end);
+    let mut clicks = clicks::read(&click_files, &people, &campaign_lookup, start, end);
     timer.mark("clicks_read_validate")?;
     clicks::sort(&mut clicks);
     timer.mark("clicks_sort_dedup")?;
@@ -136,7 +137,7 @@ fn run() -> Result<()> {
     drop(clicks);
     drop(click_files);
     drop(products);
-    parquet::users(&out, users, &people.names, &categories)?;
+    parquet::users(&out, users, people.names(), &categories)?;
     parquet::campaigns(&out, campaigns, &campaign_names, &channels)?;
     timer.mark("parquet_write")?;
     #[cfg(feature = "profiling")]
