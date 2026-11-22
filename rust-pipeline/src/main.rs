@@ -227,11 +227,12 @@ fn main() {
     let t0 = Instant::now();
     let data_dir = env_or("DATA_DIR", 1, "/data");
     let out_dir = env_or("OUTPUT_DIR", 2, "/output");
-    let nthreads: usize = std::env::var("NCPU")
+    let ncpu: usize = std::env::var("NCPU")
         .ok()
         .and_then(|v| v.parse().ok())
         .filter(|&n: &usize| n > 0)
         .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8));
+    let nthreads = ncpu + ncpu / 4;
 
     // ---- manifest, products, campaigns ----
     let manifest = std::fs::read_to_string(data_dir.join("manifest.json")).expect("manifest");
