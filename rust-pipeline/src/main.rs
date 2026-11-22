@@ -965,7 +965,8 @@ struct P3State<'a> {
     touched: Vec<u32>,
     sess: Vec<Sess>,
     starts: Vec<u32>,
-    daygroups: Vec<(u32, u32)>, // (day idx, first session index)
+    daygroups: Vec<(u32, u32)>, // (day idx, first session index), then an end sentinel
+    sgroup: Vec<u32>,           // day group of each session
     bounds: Vec<u32>,
     tmpcl: Vec<(u32, u32)>,     // (camp, ts)
     counts: Vec<u32>,
@@ -1003,6 +1004,7 @@ impl<'a> P3State<'a> {
             sess: Vec::new(),
             starts: Vec::new(),
             daygroups: Vec::new(),
+            sgroup: Vec::new(),
             bounds: Vec::new(),
             tmpcl: Vec::new(),
             counts: Vec::new(),
@@ -1186,13 +1188,16 @@ impl<'a> P3State<'a> {
         }
         self.starts.clear();
         self.daygroups.clear();
+        self.sgroup.clear();
         for (idx, s) in self.sess.iter().enumerate() {
             self.starts.push(s.start);
             if self.daygroups.last().map(|g| g.0) != Some(s.day) {
                 self.daygroups.push((s.day, idx as u32));
             }
+            self.sgroup.push(self.daygroups.len() as u32 - 1);
         }
         let nsess = self.sess.len() as u32;
+        self.daygroups.push((u32::MAX, nsess));
         self.tmpcl.clear();
         self.tmpcl.extend(cl.iter().map(|c| (c.camp, c.ts)));
         self.tmpcl.sort_unstable();
@@ -1203,6 +1208,8 @@ impl<'a> P3State<'a> {
             let mut l = self.tmpcl[g].1 as u64;
             let mut r = l + WEEK_MS as u64;
             let mut h = g + 1;
+            // windows of one campaign come in time order, so the search can resume
+            let mut from = 0usize;
             loop {
                 let done = h >= tl || self.tmpcl[h].0 != camp;
                 if !done && (self.tmpcl[h].1 as u64) <= r + 1 {
@@ -1210,16 +1217,20 @@ impl<'a> P3State<'a> {
                     h += 1;
                     continue;
                 }
-                let a = self.starts.partition_point(|&x| (x as u64) < l) as u32;
-                let b = self.starts.partition_point(|&x| (x as u64) <= r) as u32;
+                let a = from + self.starts[from..].partition_point(|&x| (x as u64) < l);
+                let b = a + self.starts[a..].partition_point(|&x| (x as u64) <= r);
+                from = b;
                 if a < b {
-                    for (gi, &(day, first)) in self.daygroups.iter().enumerate() {
-                        let end = if gi + 1 < self.daygroups.len() { self.daygroups[gi + 1].1 } else { nsess };
-                        let lo = a.max(first);
-                        let hi2 = b.min(end);
-                        if lo < hi2 {
-                            self.stats[camp as usize * nd + day as usize][3] += (hi2 - lo) as u64;
+                    let mut gi = self.sgroup[a] as usize;
+                    loop {
+                        let (day, first) = self.daygroups[gi];
+                        let end = self.daygroups[gi + 1].1 as usize;
+                        let n = b.min(end) - a.max(first as usize);
+                        self.stats[camp as usize * nd + day as usize][3] += n as u64;
+                        if end >= b {
+                            break;
                         }
+                        gi += 1;
                     }
                 }
                 if done {
