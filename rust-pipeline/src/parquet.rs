@@ -50,18 +50,10 @@ pub fn users(out: &Path, users: Users, people: &Interner, categories: &Interner)
         ("top_category", DataType::Utf8, true),
     ]);
     let mut writer = writer(out, "user_daily", schema.clone())?;
-    let mut rows: Vec<_> = users.into_iter().collect();
-    rows.sort_unstable_by_key(|(key, _)| *key);
-    for batch in rows.chunks(BATCH) {
-        let top = batch.iter().map(|(_, u)| {
-            u.categories
-                .iter()
-                .min_by(|(a, ar), (b, br)| {
-                    br.cmp(ar)
-                        .then_with(|| categories.values[**a].cmp(&categories.values[**b]))
-                })
-                .map(|(&c, _)| &*categories.values[c])
-        });
+    for batch in users.chunks(BATCH) {
+        let top = batch
+            .iter()
+            .map(|(_, u)| u.top.map(|id| categories.values[id].as_ref()));
         writer.write(&RecordBatch::try_new(
             schema.clone(),
             vec![

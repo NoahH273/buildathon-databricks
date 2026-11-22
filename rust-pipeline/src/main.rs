@@ -102,7 +102,7 @@ fn run() -> Result<()> {
     sessions::sort(&mut events);
     timer.mark("events_sort")?;
     let event_count = events.len();
-    let (sessions, users) = sessions::build(events);
+    let (sessions, users) = sessions::build(events, &categories);
     timer.mark("sessions_user_aggregation")?;
     let mut clicks = clicks::read(&data, &mut people, &campaign_lookup, start, end)?;
     timer.mark("clicks_parse_dedup_validate")?;
@@ -111,8 +111,8 @@ fn run() -> Result<()> {
     let campaigns = clicks::attribute(&sessions, &clicks, channels.len(), organic);
     timer.mark("attribution_campaign_aggregation")?;
     // Necessary conservation checks; exact correctness is checked by the independent harness.
-    let us: i128 = users.values().map(|u| i128::from(u.sessions)).sum();
-    let ur: i128 = users.values().map(|u| i128::from(u.revenue)).sum();
+    let us: i128 = users.iter().map(|(_, u)| i128::from(u.sessions)).sum();
+    let ur: i128 = users.iter().map(|(_, u)| i128::from(u.revenue)).sum();
     let cs: i128 = campaigns.values().map(|c| i128::from(c.sessions)).sum();
     let cr: i128 = campaigns.values().map(|c| i128::from(c.revenue)).sum();
     let assisted: i128 = campaigns.values().map(|c| i128::from(c.assists)).sum();

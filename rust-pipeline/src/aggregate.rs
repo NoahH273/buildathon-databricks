@@ -5,7 +5,7 @@ pub struct UserDay {
     pub sessions: i64,
     pub events: i64,
     pub revenue: i64,
-    pub categories: HashMap<Id, i64>,
+    pub top: Option<Id>,
 }
 #[derive(Default, Debug, PartialEq)]
 pub struct CampaignDay {
@@ -14,5 +14,5 @@ pub struct CampaignDay {
     pub revenue: i64,
     pub assists: i64,
 }
-pub type Users = HashMap<(Id, i32), UserDay>;
+pub type Users = Vec<((Id, i32), UserDay)>;
 pub type Campaigns = HashMap<(Id, i32), CampaignDay>;
