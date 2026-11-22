@@ -493,7 +493,11 @@ fn main() {
             let get = |id: u32| -> &Ev1 {
                 unsafe { srcs.get_unchecked((id >> SRC_SHIFT) as usize).get_unchecked((id & ((1 << SRC_SHIFT) - 1)) as usize) }
             };
+            // keep[flat index] = 1 while that record is its event_id's current winner
+            keep.clear();
+            keep.resize(n, 0);
             for (t, src) in srcs.iter().enumerate() {
+                let base = offs[t];
                 for (i, r) in src.iter().enumerate() {
                     let id = ((t as u32) << SRC_SHIFT) | i as u32;
                     let h = r.eid;
@@ -502,12 +506,18 @@ fn main() {
                         let cur = unsafe { *table.get_unchecked(slot) };
                         if cur == u32::MAX {
                             table[slot] = id;
+                            unsafe { *keep.get_unchecked_mut(base + i) = 1 };
                             break;
                         }
                         let other = get(cur);
                         if other.eid == h {
                             if r.ingest < other.ingest {
                                 table[slot] = id;
+                                let old = offs[(cur >> SRC_SHIFT) as usize] + (cur & ((1 << SRC_SHIFT) - 1)) as usize;
+                                unsafe {
+                                    *keep.get_unchecked_mut(old) = 0;
+                                    *keep.get_unchecked_mut(base + i) = 1;
+                                }
                             }
                             break;
                         }
@@ -515,19 +525,14 @@ fn main() {
                     }
                 }
             }
-            keep.clear();
-            keep.resize(n, 0);
-            for &id in table.iter() {
-                if id != u32::MAX {
-                    let flat = offs[(id >> SRC_SHIFT) as usize] + (id & ((1 << SRC_SHIFT) - 1)) as usize;
-                    unsafe { *keep.get_unchecked_mut(flat) = 1 };
-                }
-            }
             for (t, src) in srcs.iter().enumerate() {
                 let kp = &keep[offs[t]..offs[t] + src.len()];
                 // resolve linked IDs here, prefetching the link table a few records ahead
                 const AHEAD: usize = 8;
                 for (i, (r, &k)) in src.iter().zip(kp.iter()).enumerate() {
+                    if let Some(f) = src.get(i + 2 * AHEAD) {
+                        linked.map.prefetch_filter(f.person);
+                    }
                     if let Some(f) = src.get(i + AHEAD) {
                         linked.map.prefetch(f.person);
                     }

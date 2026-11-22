@@ -27,6 +27,9 @@ pub const MAX_COMPS: usize = (1 << (64 - FP_BITS)) - 2;
 pub struct LinkMap {
     slots: Vec<u64>,
     meta: [(u32, u32); NP], // (offset, capacity)
+    // one bit per low-hash-bits value of a linked ID; a clear bit means "not linked"
+    filter: Vec<u64>,
+    fmask: u64,
 }
 
 impl LinkMap {
@@ -37,7 +40,26 @@ impl LinkMap {
         (off as usize, cap as usize, home)
     }
     #[inline(always)]
+    pub fn maybe(&self, k: u64) -> bool {
+        let b = k & self.fmask;
+        unsafe { (*self.filter.get_unchecked((b >> 6) as usize) >> (b & 63)) & 1 != 0 }
+    }
+    #[inline(always)]
+    pub fn prefetch_filter(&self, k: u64) {
+        let b = k & self.fmask;
+        unsafe {
+            std::arch::x86_64::_mm_prefetch(
+                self.filter.as_ptr().add((b >> 6) as usize) as *const i8,
+                std::arch::x86_64::_MM_HINT_T0,
+            );
+        }
+    }
+    /// Prefetch the table slot of a key that may be linked.
+    #[inline(always)]
     pub fn prefetch(&self, k: u64) {
+        if !self.maybe(k) {
+            return;
+        }
         let (off, _, i) = self.slot_index(k);
         unsafe {
             std::arch::x86_64::_mm_prefetch(
@@ -67,6 +89,9 @@ impl LinkMap {
     /// Person key and name word for a user hash and that user's own name ref.
     #[inline(always)]
     pub fn resolve(&self, user: u64, own_name: u64) -> (u64, u64) {
+        if !self.maybe(user) {
+            return (user, own_name);
+        }
         match self.get(user) {
             Some(ci) => (comp_person(ci), crate::LINKED_BIT | ci),
             None => (user, own_name),
@@ -318,5 +343,15 @@ where
         t_names,
         t.elapsed()
     );
-    Linked { map: LinkMap { slots, meta }, names }
+    let used = slots.iter().filter(|&&s| s != 0).count();
+    let fbits = (used * 16).next_power_of_two().clamp(1 << 16, 1 << 28);
+    let fmask = fbits as u64 - 1;
+    let mut filter = vec![0u64; fbits / 64];
+    for &s in slots.iter() {
+        if s != 0 {
+            let b = s & fmask;
+            filter[(b >> 6) as usize] |= 1 << (b & 63);
+        }
+    }
+    Linked { map: LinkMap { slots, meta, filter, fmask }, names }
 }
