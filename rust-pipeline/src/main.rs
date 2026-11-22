@@ -313,7 +313,7 @@ fn main() {
     let mut chunks: Vec<Chunk> = Vec::new();
     let mut ev_bytes = 0usize;
     let mut cl_bytes = 0usize;
-    const CHUNK: usize = 4 << 20;
+    const CHUNK: usize = 2 << 20;
     const LCHUNK: usize = 1 << 20;
     let mut paths: Vec<(u8, PathBuf)> = Vec::new();
     for (kind, sub) in [(0u8, "links"), (1, "clicks"), (2, "events")] {
