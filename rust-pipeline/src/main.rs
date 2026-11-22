@@ -20,7 +20,7 @@ const OFF_BITS: u32 = 40;
 const OFF_MASK: u64 = (1u64 << OFF_BITS) - 1;
 pub const LINKED_BIT: u64 = 1 << 63;
 const B1: usize = 6; // staging depth, event_id partitions
-const B2: usize = 8; // staging depth, person partitions
+const B2: usize = 16; // staging depth, person partitions
 const RING: usize = 8; // link lookups in flight per parsing thread
 const NO_PROD: u16 = u16::MAX;
 
