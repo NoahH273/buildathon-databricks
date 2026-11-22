@@ -8,7 +8,6 @@ use links::{LinkRec, Linked};
 use memmap2::Mmap;
 use parse::*;
 use scatter::Scatter;
-use std::cmp::Ordering as CmpOrd;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -850,16 +849,17 @@ fn parse_events(ctx: &Ctx, c: Chunk, out: &mut Scatter<Ev1, B1>) {
 // ---------------------------------------------------------------------------
 // Phase 3
 
-/// Gather the records of one person partition from `srcs` into `v`, sorted by (person, then
-/// `cmp`): a counting pass on the person bits just below the partition bits, then a small sort
-/// inside each bucket.
-fn bucket_sort<T: Copy>(
+/// Gather `srcs` into `v` sorted by (person, ts): LSD radix on ts (three 11-bit digits), then a
+/// stable pass on the person bits below the partition bits. People that share a bucket are then
+/// separated by a stable sort on person, which keeps their ts order.
+fn radix_sort<T: Copy>(
     srcs: &[&[T]],
     v: &mut Vec<T>,
-    counts: &mut Vec<u32>,
+    tmp: &mut Vec<T>,
+    hist: &mut Vec<u32>,
     b2: u32,
     person: impl Fn(&T) -> u64,
-    cmp: impl Fn(&T, &T) -> CmpOrd,
+    ts: impl Fn(&T) -> u32,
 ) {
     let n: usize = srcs.iter().map(|s| s.len()).sum();
     v.clear();
@@ -867,60 +867,79 @@ fn bucket_sort<T: Copy>(
         for s in srcs {
             v.extend_from_slice(s);
         }
-        v.sort_unstable_by(|a, b| person(a).cmp(&person(b)).then_with(|| cmp(a, b)));
+        v.sort_unstable_by(|a, b| person(a).cmp(&person(b)).then_with(|| ts(a).cmp(&ts(b))));
         return;
     }
     let kb = ((n / 4).next_power_of_two().trailing_zeros()).clamp(1, 16);
     let k = 1usize << kb;
     let shift = 64 - b2 - kb;
     let bucket = |x: &T| ((person(x) >> shift) as usize) & (k - 1);
-    counts.clear();
-    counts.resize(k, 0);
+    const D: usize = 2048;
+    hist.clear();
+    hist.resize(3 * D + k, 0);
+    let (h0, rest) = hist.split_at_mut(D);
+    let (h1, rest) = rest.split_at_mut(D);
+    let (h2, hb) = rest.split_at_mut(D);
     for s in srcs {
         for x in s.iter() {
-            counts[bucket(x)] += 1;
-        }
-    }
-    let mut acc = 0u32;
-    for c in counts.iter_mut() {
-        let t = *c;
-        *c = acc;
-        acc += t;
-    }
-    v.reserve(n);
-    unsafe {
-        v.set_len(n);
-        for s in srcs {
-            for x in s.iter() {
-                let b = bucket(x);
-                let p = counts.get_unchecked_mut(b);
-                *v.get_unchecked_mut(*p as usize) = *x;
-                *p += 1;
+            let t = ts(x) as usize;
+            unsafe {
+                *h0.get_unchecked_mut(t & (D - 1)) += 1;
+                *h1.get_unchecked_mut((t >> 11) & (D - 1)) += 1;
+                *h2.get_unchecked_mut((t >> 22) & (D - 1)) += 1;
+                *hb.get_unchecked_mut(bucket(x)) += 1;
             }
         }
     }
-    // counts[b] is now the end of bucket b
+    for h in [&mut *h0, &mut *h1, &mut *h2, &mut *hb] {
+        let mut acc = 0u32;
+        for c in h.iter_mut() {
+            let t = *c;
+            *c = acc;
+            acc += t;
+        }
+    }
+    v.reserve(n);
+    tmp.reserve(n);
+    unsafe {
+        v.set_len(n);
+        tmp.set_len(n);
+        let (vp, tp) = (v.as_mut_ptr(), tmp.as_mut_ptr());
+        for s in srcs {
+            for x in s.iter() {
+                let p = h0.get_unchecked_mut(ts(x) as usize & (D - 1));
+                *tp.add(*p as usize) = *x;
+                *p += 1;
+            }
+        }
+        for i in 0..n {
+            let x = &*tp.add(i);
+            let p = h1.get_unchecked_mut((ts(x) as usize >> 11) & (D - 1));
+            *vp.add(*p as usize) = *x;
+            *p += 1;
+        }
+        for i in 0..n {
+            let x = &*vp.add(i);
+            let p = h2.get_unchecked_mut((ts(x) as usize >> 22) & (D - 1));
+            *tp.add(*p as usize) = *x;
+            *p += 1;
+        }
+        for i in 0..n {
+            let x = &*tp.add(i);
+            let p = hb.get_unchecked_mut(bucket(x));
+            *vp.add(*p as usize) = *x;
+            *p += 1;
+        }
+    }
+    // hb[b] is now the end of bucket b
     let mut start = 0usize;
     for b in 0..k {
-        let end = counts[b] as usize;
-        let len = end - start;
-        if len > 1 {
+        let end = hb[b] as usize;
+        if end - start > 1 {
             let s = &mut v[start..end];
-            if len <= 16 {
-                for i in 1..len {
-                    let mut j = i;
-                    while j > 0 {
-                        let (a, bb) = (&s[j - 1], &s[j]);
-                        if person(a).cmp(&person(bb)).then_with(|| cmp(a, bb)) == CmpOrd::Greater {
-                            s.swap(j - 1, j);
-                            j -= 1;
-                        } else {
-                            break;
-                        }
-                    }
-                }
-            } else {
-                s.sort_unstable_by(|a, b| person(a).cmp(&person(b)).then_with(|| cmp(a, b)));
+            let p0 = person(&s[0]);
+            if s.iter().any(|x| person(x) != p0) {
+                s.sort_by_key(|x| person(x));
             }
         }
         start = end;
@@ -950,6 +969,8 @@ struct P3State<'a> {
     bounds: Vec<u32>,
     tmpcl: Vec<(u32, u32)>,     // (camp, ts)
     counts: Vec<u32>,
+    tmp_ev: Vec<Ev2>,
+    tmp_cl: Vec<Cl>,
     // user_daily columns
     rows: usize,
     names: Vec<u8>,
@@ -985,6 +1006,8 @@ impl<'a> P3State<'a> {
             bounds: Vec::new(),
             tmpcl: Vec::new(),
             counts: Vec::new(),
+            tmp_ev: Vec::new(),
+            tmp_cl: Vec::new(),
             rows: 0,
             names: Vec::new(),
             days: Vec::new(),
@@ -1003,14 +1026,21 @@ impl<'a> P3State<'a> {
         evs: &mut Vec<Ev2>,
         cls: &mut Vec<Cl>,
     ) {
-        bucket_sort(ev_srcs, evs, &mut self.counts, ctx.b2, |e| e.person, |a, b| {
-            let (at, bt) = (a.ts, b.ts);
-            at.cmp(&bt)
-        });
-        bucket_sort(cl_srcs, cls, &mut self.counts, ctx.b2, |c| c.person, |a, b| {
-            let (at, bt) = (a.ts, b.ts);
-            at.cmp(&bt).then_with(|| ctx.ref_str(a.cid).cmp(ctx.ref_str(b.cid)))
-        });
+        radix_sort(ev_srcs, evs, &mut self.tmp_ev, &mut self.counts, ctx.b2, |e| e.person, |e| e.ts);
+        radix_sort(cl_srcs, cls, &mut self.tmp_cl, &mut self.counts, ctx.b2, |c| c.person, |c| c.ts);
+        // clicks at the same (person, ts) are ordered by click_id
+        let mut i = 0;
+        while i + 1 < cls.len() {
+            let (p, t) = (cls[i].person, cls[i].ts);
+            let mut j = i + 1;
+            while j < cls.len() && cls[j].person == p && cls[j].ts == t {
+                j += 1;
+            }
+            if j - i > 1 {
+                cls[i..j].sort_by(|a, b| ctx.ref_str(a.cid).cmp(ctx.ref_str(b.cid)));
+            }
+            i = j;
+        }
         let n = evs.len();
         // person boundaries, so that name lookups can be prefetched a few people ahead
         self.bounds.clear();
