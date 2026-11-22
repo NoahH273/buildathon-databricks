@@ -3,7 +3,9 @@ WORKDIR /build
 COPY rust-pipeline/Cargo.toml rust-pipeline/Cargo.lock ./
 COPY rust-pipeline/src ./src
 # The submission binary cannot activate checkpointing or diagnostics at runtime.
-RUN cargo build --release --locked --no-default-features
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=secret,id=cargo_ca,target=/etc/ssl/certs/ca-certificates.crt \
+    cargo build --release --locked --no-default-features
 
 FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc
 COPY --from=builder /build/target/release/shopping-sessions /usr/local/bin/shopping-sessions
