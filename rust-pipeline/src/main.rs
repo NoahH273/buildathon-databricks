@@ -258,27 +258,35 @@ fn main() {
     assert!(we - base < INVALID as i64, "window too long");
 
     let prod_data = std::fs::read(data_dir.join("products.csv")).unwrap_or_default();
-    let mut cat_names: Vec<Vec<u8>> = Vec::new();
-    let mut prod_rows: Vec<(u64, Option<u32>, Vec<u8>)> = Vec::new();
+    let mut raw_cats: Vec<&[u8]> = Vec::new();
+    let mut cat_ix: std::collections::HashMap<&[u8], u32> = std::collections::HashMap::new();
+    let mut prod_rows: Vec<(u64, Option<u32>, u32)> = Vec::with_capacity(prod_data.len() / 16);
     for line in small_lines(&prod_data) {
         let mut f = [(0, 0); 2];
         if !split::<2>(line, &mut f) || f[0].0 == f[0].1 {
             continue;
         }
         let pid = &line[f[0].0..f[0].1];
-        prod_rows.push((hash(pid), product_num_slice(pid), line[f[1].0..f[1].1].to_vec()));
-        cat_names.push(line[f[1].0..f[1].1].to_vec());
+        let c = &line[f[1].0..f[1].1];
+        let ci = *cat_ix.entry(c).or_insert_with(|| {
+            raw_cats.push(c);
+            raw_cats.len() as u32 - 1
+        });
+        prod_rows.push((hash(pid), product_num_slice(pid), ci));
     }
+    let mut cat_names: Vec<Vec<u8>> = raw_cats.iter().map(|c| c.to_vec()).collect();
     cat_names.push(b"unknown".to_vec());
     cat_names.sort();
     cat_names.dedup();
     assert!(cat_names.len() <= 256, "too many categories");
+    let cat_id: Vec<u32> =
+        raw_cats.iter().map(|c| cat_names.binary_search_by(|x| x.as_slice().cmp(c)).unwrap() as u32).collect();
     // `p<number>` ids index an array; any other id goes through the hash map
     const PROD_LIMIT: u32 = 1 << 22;
     let mut products = U64Map::with_capacity(prod_rows.len());
     let mut prod_arr: Vec<u16> = Vec::new();
-    for (h, num, c) in &prod_rows {
-        let id = cat_names.binary_search(c).unwrap() as u32;
+    for &(ref h, ref num, ci) in &prod_rows {
+        let id = cat_id[ci as usize];
         match num {
             Some(n) if *n < PROD_LIMIT => {
                 let n = *n as usize;
@@ -324,19 +332,46 @@ fn main() {
     let mut cl_bytes = 0usize;
     const CHUNK: usize = 4 << 20;
     const LCHUNK: usize = 1 << 20;
+    let mut paths: Vec<(u8, PathBuf)> = Vec::new();
     for (kind, sub) in [(0u8, "links"), (1, "clicks"), (2, "events")] {
         for p in list_csv(&data_dir.join(sub)) {
-            let fid = files.len() as u32;
-            let m = if load_mem {
-                let v = std::fs::read(&p).unwrap();
-                if v.is_empty() {
-                    None
-                } else {
-                    Some(FileData::Mem(v))
+            paths.push((kind, p));
+        }
+    }
+    let mut maps: Vec<Option<FileData>> = {
+        let next = AtomicUsize::new(0);
+        let mut got: Vec<(usize, Option<FileData>)> = par(nthreads, |_| {
+            let mut v = Vec::new();
+            loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                if i >= paths.len() {
+                    break;
                 }
-            } else {
-                map_file(&p).map(FileData::Map)
-            };
+                let p = &paths[i].1;
+                let m = if load_mem {
+                    let d = std::fs::read(p).unwrap();
+                    if d.is_empty() {
+                        None
+                    } else {
+                        Some(FileData::Mem(d))
+                    }
+                } else {
+                    map_file(p).map(FileData::Map)
+                };
+                v.push((i, m));
+            }
+            v
+        })
+        .into_iter()
+        .flatten()
+        .collect();
+        got.sort_unstable_by_key(|x| x.0);
+        got.into_iter().map(|x| x.1).collect()
+    };
+    for (i, &(kind, _)) in paths.iter().enumerate() {
+        {
+            let fid = files.len() as u32;
+            let m = maps[i].take();
             let len = match &m {
                 Some(FileData::Map(x)) => x.len(),
                 Some(FileData::Mem(x)) => x.len(),
