@@ -984,8 +984,6 @@ struct P3State<'a> {
     win: Vec<(u64, u64)>, // open assist window per campaign, (MAX, 0) when none
     wfrom: Vec<u32>,      // per campaign: first session index not yet passed
     wtouched: Vec<u32>,
-    stamp: Vec<u32>, // per campaign: last session (by generation) it was counted for
-    stamp_gen: u32,
     counts: Vec<u32>,
     tmp_ev: Vec<Ev2>,
     tmp_cl: Vec<Cl>,
@@ -1026,8 +1024,6 @@ impl<'a> P3State<'a> {
             win: vec![(u64::MAX, 0); ncampx],
             wfrom: vec![0; ncampx],
             wtouched: Vec::new(),
-            stamp: vec![0; ncampx],
-            stamp_gen: 0,
             counts: Vec::new(),
             tmp_ev: Vec::new(),
             tmp_cl: Vec::new(),
@@ -1200,39 +1196,10 @@ impl<'a> P3State<'a> {
             x[2] += s.rev;
         }
 
-        // assists
+        // assists: union of [click, click + 7d] per campaign, sessions starting inside
         if cl.is_empty() {
             return;
         }
-        if self.sess.len() * cl.len() <= 4096 {
-            // few sessions and clicks: slide the 7-day click window along the sessions and
-            // count each campaign once per session
-            let (mut lo, mut hi) = (0usize, 0usize);
-            for s in self.sess.iter() {
-                let t = s.start as u64;
-                while hi < cl.len() && cl[hi].ts as u64 <= t {
-                    hi += 1;
-                }
-                while lo < hi && cl[lo].ts as u64 + (WEEK_MS as u64) < t {
-                    lo += 1;
-                }
-                self.stamp_gen = self.stamp_gen.wrapping_add(1);
-                if self.stamp_gen == 0 {
-                    self.stamp.iter_mut().for_each(|x| *x = 0);
-                    self.stamp_gen = 1;
-                }
-                let g = self.stamp_gen;
-                for c in &cl[lo..hi] {
-                    let camp = c.camp as usize;
-                    if self.stamp[camp] != g {
-                        self.stamp[camp] = g;
-                        self.stats[camp * nd + s.day as usize][3] += 1;
-                    }
-                }
-            }
-            return;
-        }
-        // otherwise: union of [click, click + 7d] per campaign, count sessions starting inside
         self.starts.clear();
         self.daygroups.clear();
         self.sgroup.clear();
