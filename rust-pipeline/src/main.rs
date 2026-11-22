@@ -421,7 +421,8 @@ fn main() {
             for &c in &link_chunks {
                 parse_links(&ctx, c, &mut out);
             }
-            let l = links::build(vec![out], nthreads, |r| ctx.ref_str(r));
+            // half the threads: links finish well before events, and fewer workers fight the parsers
+            let l = links::build(vec![out], (nthreads / 2).max(1), |r| ctx.ref_str(r));
             eprintln!("links done {:?}", t0.elapsed());
             l
         });
