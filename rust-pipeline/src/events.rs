@@ -62,10 +62,16 @@ fn repeated_bits(chunks: &[&[u8]], bytes: usize, hash: &RandomState) -> Vec<u64>
     repeated.into_iter().map(AtomicU64::into_inner).collect()
 }
 
+struct Pending<'a> {
+    id: &'a str,
+    ingest: i64,
+    event: Option<Event>,
+}
+
 #[derive(Default)]
 struct Batch<'a> {
     events: Vec<Event>,
-    pending: Vec<&'a [u8]>,
+    pending: Vec<Pending<'a>>,
     singletons: Vec<&'a str>,
     profile: Breakdown,
 }
@@ -137,12 +143,6 @@ pub fn read<const DETAIL: bool>(
             let mut batch = Batch::default();
             let mut local = AHashMap::new();
             for line in csv::lines(chunk) {
-                let id = raw_id(line);
-                let (word, mask) = bit_position(&hash, repeated.len(), id);
-                if repeated[word] & mask != 0 {
-                    batch.pending.push(line);
-                    continue;
-                }
                 let Some(f) = batch
                     .profile
                     .measure::<DETAIL, _>(Step::CsvStructureUtf8, || csv::parse(line))
@@ -153,18 +153,24 @@ pub fn read<const DETAIL: bool>(
                     continue;
                 }
                 let ingest = ingest::<DETAIL>(&f, &mut batch.profile);
-                if let Some(event) =
-                    project::<DETAIL>(&f, ingest, catalog, &mut batch.profile, |user| {
-                        if let Some(id) = people.names.lookup(user) {
-                            return canonical[id];
-                        }
-                        *local.entry(user).or_insert_with(|| {
-                            let id = canonical.len() + batch.singletons.len();
-                            batch.singletons.push(user);
-                            id
-                        })
+                let event = project::<DETAIL>(&f, ingest, catalog, &mut batch.profile, |user| {
+                    if let Some(id) = people.names.lookup(user) {
+                        return canonical[id];
+                    }
+                    *local.entry(user).or_insert_with(|| {
+                        let id = canonical.len() + batch.singletons.len();
+                        batch.singletons.push(user);
+                        id
                     })
-                {
+                });
+                let (word, mask) = bit_position(&hash, repeated.len(), f[0].as_bytes());
+                if repeated[word] & mask != 0 {
+                    batch.pending.push(Pending {
+                        id: f[0],
+                        ingest,
+                        event,
+                    });
+                } else if let Some(event) = event {
                     batch.events.push(event);
                 }
             }
@@ -177,7 +183,7 @@ pub fn read<const DETAIL: bool>(
             detail.merge(std::mem::take(&mut batch.profile));
         }
     }
-    timer.mark_detailed("events_project_unique", DETAIL.then_some(&detail))?;
+    timer.mark_detailed("events_project_candidates", DETAIL.then_some(&detail))?;
 
     // Only this pass mutates the shared name table. Convert each chunk's new
     // singleton names once, including names discovered in another chunk.
@@ -195,7 +201,12 @@ pub fn read<const DETAIL: bool>(
         .par_iter_mut()
         .zip(translations)
         .for_each(|(batch, ids)| {
-            for event in &mut batch.events {
+            for event in batch.events.iter_mut().chain(
+                batch
+                    .pending
+                    .iter_mut()
+                    .filter_map(|row| row.event.as_mut()),
+            ) {
                 if event.person >= canonical.len() {
                     event.person = ids[event.person - canonical.len()];
                 }
@@ -211,22 +222,12 @@ pub fn read<const DETAIL: bool>(
     let mut detail = Breakdown::default();
     for mut batch in batches {
         events.append(&mut batch.events);
-        for line in batch.pending {
-            let Some(f) = detail.measure::<DETAIL, _>(Step::CsvStructureUtf8, || csv::parse(line))
-            else {
-                continue;
-            };
-            if f[0].is_empty() {
-                continue;
-            }
-            let ingest = ingest::<DETAIL>(&f, &mut detail);
+        for row in batch.pending {
             let winner = detail.measure::<DETAIL, _>(Step::DedupLookup, || {
-                winners.entry(f[0]).or_insert((i64::MAX, None))
+                winners.entry(row.id).or_insert((i64::MAX, None))
             });
-            if ingest < winner.0 {
-                let event =
-                    project::<DETAIL>(&f, ingest, catalog, &mut detail, |user| people.person(user));
-                *winner = (ingest, event);
+            if row.ingest < winner.0 {
+                *winner = (row.ingest, row.event);
             }
         }
     }

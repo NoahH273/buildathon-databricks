@@ -213,7 +213,7 @@ fn detailed_checkpoints_account_for_rows_and_respect_profile_gate() {
     }
     for (phase, step, calls) in [
         ("events_resolve_repeats", "dedup_hash_lookup_compare", 2),
-        ("events_resolve_repeats", "event_timestamp_window", 1),
+        ("events_project_candidates", "event_timestamp_window", 2),
         ("events_resolve_repeats", "collect_winners", 1),
     ] {
         let metrics = &records.iter().find(|r| r["name"] == phase).unwrap()["metrics"];
